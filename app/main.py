@@ -106,6 +106,10 @@ class Storage:
         return BulkString(b=item.value.b)
 
     def set(self, key: bytes, value: bytes, expire: datetime.datetime | None = None):
+        now = datetime.datetime.now(tz=datetime.UTC)
+        if expire and expire < now:
+            print("KEY EXPIRED (probably read from rdb)", key)
+            return SimpleString(s="OK")
         self.storage[key] = StorageItem(
             meta=StorageMeta(expire=expire), value=Simple(b=value)
         )
@@ -740,6 +744,7 @@ def read_rdb(params: Params) -> Storage:
     magic, data = data[:5], data[5:]
     assert magic == b"REDIS"
     version, data = data[:4], data[4:]
+    expiry = None
 
     while data:
         byte, data = data[0], data[1:]
@@ -759,12 +764,18 @@ def read_rdb(params: Params) -> Storage:
             _hash_table_size, data = _rdb_read_length(data)
             _expiry_table_size, data = _rdb_read_length(data)
             continue
+        if byte == 0xFC:  # EXPIRETIMEMS
+            ms_raw, data = data[:8], data[8:]
+            ms = int.from_bytes(ms_raw, "little")
+            expiry = datetime.datetime.fromtimestamp(ms / 1000.0, tz=datetime.UTC)
+            continue
         if 0 <= byte <= 14:  # VALUE TYPE:
             value_type = byte
             key, data = _rdb_read_str(data)
             if value_type == 0:  # String Encoding
                 value, data = _rdb_read_str(data)
-                rdb_store.set(key, value)
+                rdb_store.set(key, value, expiry)
+                expiry = None
                 continue
 
             print(f"{value_type=}")
