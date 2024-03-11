@@ -168,52 +168,59 @@ class Storage:
         return item.value.type()
 
     @staticmethod
-    def x_validate_id(s: Stream, new_id: XID) -> SimpleError | None:
-        try:
-            last_id = s.s[-1][0]
-        except IndexError:
-            last_id = XID(0, 0)
-
-        if new_id <= XID(0, 0):
+    def x_validate_id(last_xid: XID, new_xid: XID) -> SimpleError | None:
+        if new_xid <= XID(0, 0):
             return SimpleError(
                 e="ERR",
                 m="The ID specified in XADD must be greater than 0-0",
             )
 
-        if new_id <= last_id:
+        if last_xid is not None and new_xid <= last_xid:
             return SimpleError(
                 e="ERR",
                 m="The ID specified in XADD is equal or smaller than the target stream top item",
             )
         return None
 
-    def xadd(self, key: bytes, xid: XID, tuples: list):
+    @staticmethod
+    def gen_seq(last_xid: XID | None, time: int):
+        if last_xid is None:
+            return 0 if time > 0 else 1
+        elif last_xid.time == time:
+            return last_xid.seq + 1
+        return 0
+
+    def xadd(self, key: bytes, id_raw: bytes, tuples: list):
         value = self.storage.setdefault(
             key, StorageItem(meta=StorageMeta(), value=Stream(s=[]))
         ).value
         assert isinstance(value, Stream)  # TODO: wrong type
 
-        assert xid.time != -1
-        if xid.seq == -1:
-            try:
-                last_time = value.s[-1][0].time
-                last_seq = value.s[-1][0].seq
+        try:
+            last_xid = value.s[-1][0]
+        except IndexError:
+            last_xid = None
 
-                if last_time == xid.time:
-                    xid = XID(xid.time, last_seq + 1)
-                elif xid.time > 0:
-                    xid = XID(xid.time, 0)
-                else:
-                    xid = XID(0, 1)
-            except IndexError:
-                xid = XID(0, 1)
+        if id_raw == b"*":
+            time = int(datetime.datetime.now(tz=datetime.UTC).timestamp() * 1000)
+            seq = self.gen_seq(last_xid, time)
+            new_xid = XID(time, seq)
+        else:
+            time_raw, seq_raw = id_raw.split(b"-")
+            if seq_raw == b"*":
+                time = int(time_raw)
+                seq = self.gen_seq(last_xid, time)
+                new_xid = XID(time, seq)
+            else:
+                time, seq = int(time_raw), int(seq_raw)
+                new_xid = XID(time, seq)
 
-        err = self.x_validate_id(value, xid)
+        err = self.x_validate_id(last_xid, new_xid)
         if err is not None:
             return err
 
-        value.s.append((xid, dict(tuples)))
-        return BulkString(b=f"{xid.time}-{xid.seq}".encode())
+        value.s.append((new_xid, dict(tuples)))
+        return BulkString(b=f"{new_xid.time}-{new_xid.seq}".encode())
 
 
 def read_next_value(data: bytes) -> tuple[ProtocolItem, bytes, int] | None:
@@ -666,23 +673,13 @@ def xadd_command(
     GGG += 1
     key = command.args[0]
     id_raw = command.args[1]
-    if id_raw == "*":
-        ident = XID(-1, -1)
-    else:
-        time_raw, seq_raw = id_raw.split(b"-")
-        if seq_raw == b"*":
-            time, seq = int(time_raw), -1
-            ident = XID(time, seq)
-        else:
-            time, seq = int(time_raw), int(seq_raw)
-            ident = XID(time, seq)
 
     tuples = []
     # TODO 3.12 batched
     for tuple_ in batched(command.args[2:], n=2):
         print(tuple_)
 
-    response = store.xadd(key, ident, tuples)
+    response = store.xadd(key, id_raw, tuples)
     client.send(response.serialize())
 
 
