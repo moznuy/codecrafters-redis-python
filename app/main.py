@@ -214,6 +214,23 @@ def replconf_command(
     client.socket.sendall(response)
 
 
+def psync_command(store: Storage, params: Params, client: Client, item: ProtocolItem):
+    assert isinstance(item, Array)
+    repl_id = item.a[1]
+    assert isinstance(repl_id, BulkString)
+    repl_offset = item.a[2]
+    assert isinstance(repl_offset, BulkString)
+    print("REPLICA: PSYNC", repl_id.b, repl_offset.b)
+    assert repl_id.b.decode() == "?"
+    assert int(repl_offset.b) == -1
+
+    result = SimpleString(
+        s=f"FULLRESYNC {params.master_replid} {params.master_repl_offset}"
+    )
+    response = result.serialize()
+    client.socket.sendall(response)
+
+
 f_mapping = {
     b"PING": ping_command,
     b"ECHO": echo_command,
@@ -221,6 +238,7 @@ f_mapping = {
     b"SET": set_command,
     b"INFO": info_command,
     b"REPLCONF": replconf_command,
+    b"PSYNC": psync_command,
 }
 
 
