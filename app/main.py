@@ -103,7 +103,7 @@ class Simple(StorageValue):
 
 @dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
 class Stream(StorageValue):
-    s: list[tuple[XID, dict[bytes, bytes]]]
+    s: list[tuple[XID, list[tuple[bytes, bytes]]]]
 
     @staticmethod
     def type():
@@ -219,8 +219,61 @@ class Storage:
         if err is not None:
             return err
 
-        value.s.append((new_xid, dict(tuples)))
+        value.s.append((new_xid, tuples))
         return BulkString(b=f"{new_xid.time}-{new_xid.seq}".encode())
+
+    @staticmethod
+    def _get_seq(raw: bytes, default: int):
+        warmer = raw.split(b"-")
+        if len(warmer) == 1:
+            xid = XID(int(warmer[0]), default)
+        else:
+            xid = XID(int(warmer[0]), int(warmer[1]))
+        return xid
+
+    def xrange(self, key: bytes, start_raw: bytes, end_raw: bytes):
+        start = self._get_seq(start_raw, -1)
+        end = self._get_seq(end_raw, 2**64 - 1)
+
+        value = self.storage.setdefault(
+            key, StorageItem(meta=StorageMeta(), value=Stream(s=[]))
+        ).value
+        assert isinstance(value, Stream)  # TODO: wrong type
+        result = []
+        for xid, items in value.s:
+            if start <= xid <= end:  # TODO: binary search
+                result.append(Array(a=[encode_xid(xid), encode_array(items)]))
+        return Array(a=result)
+
+
+# TODO: use everywhere
+def encode_int(n: int) -> BulkString:
+    assert isinstance(n, int)
+    return BulkString(b=str(n).encode())
+
+
+# TODO: use everywhere
+def encode_xid(n: XID) -> BulkString:
+    assert isinstance(n, XID)
+    return BulkString(b=f"{n.time}-{n.seq}".encode())
+
+
+# TODO: use everywhere
+def encode_array(a: list) -> Array:
+    assert isinstance(a, list)
+    res = []
+    for x in a:
+        if isinstance(x, bytes):
+            res.append(BulkString(b=x))
+            continue
+        if isinstance(x, tuple):
+            for i in x:
+                assert isinstance(i, bytes)
+                res.append(BulkString(b=i))
+            continue
+        print(x)
+        raise NotImplementedError
+    return Array(a=res)
 
 
 def read_next_value(data: bytes) -> tuple[ProtocolItem, bytes, int] | None:
@@ -658,9 +711,6 @@ def batched(lst, n):
     return iter(lambda: tuple(itertools.islice(it, n)), ())
 
 
-GGG = 0
-
-
 def xadd_command(
     loop: list,
     store: Storage,
@@ -669,17 +719,28 @@ def xadd_command(
     command: Command,
     replication_connection: bool,
 ):
-    global GGG
-    GGG += 1
     key = command.args[0]
     id_raw = command.args[1]
 
-    tuples = []
     # TODO 3.12 batched
-    for tuple_ in batched(command.args[2:], n=2):
-        print(tuple_)
-
+    tuples = list(batched(command.args[2:], n=2))
     response = store.xadd(key, id_raw, tuples)
+    client.send(response.serialize())
+
+
+def xrange_command(
+    loop: list,
+    store: Storage,
+    params: Params,
+    client: Client,
+    command: Command,
+    replication_connection: bool,
+):
+    key = command.args[0]
+    start = command.args[1]
+    end = command.args[2]
+
+    response = store.xrange(key, start, end)
     client.send(response.serialize())
 
 
@@ -710,6 +771,7 @@ f_mapping: dict[bytes, CommandProtocol] = {
     b"KEYS": keys_command,
     b"TYPE": type_command,
     b"XADD": xadd_command,
+    b"XRANGE": xrange_command,
 }
 
 
