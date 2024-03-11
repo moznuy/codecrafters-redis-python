@@ -26,6 +26,14 @@ class SimpleString(ProtocolItem):
 
 
 @dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
+class Integer(ProtocolItem):
+    n: int
+
+    def serialize(self) -> bytes:
+        return b":" + str(self.n).encode() + b"\r\n"
+
+
+@dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
 class BulkString(ProtocolItem):
     b: bytes
 
@@ -361,6 +369,26 @@ def select_command(
     pass
 
 
+def wait_command(
+    store: Storage,
+    params: Params,
+    client: Client,
+    item: ProtocolItem,
+    replication_connection: bool,
+):
+    assert isinstance(item, Array)
+    replicas_raw = item.a[1]
+    wait_ms_raw = item.a[2]
+    assert isinstance(replicas_raw, BulkString)
+    assert isinstance(wait_ms_raw, BulkString)
+    replicas = int(replicas_raw.b)
+    wait_ms = int(wait_ms_raw.b)
+
+    result = Integer(n=0)
+    response = result.serialize()
+    client.socket.sendall(response)
+
+
 class CommandProtocol(Protocol):
     def __call__(
         self,
@@ -382,6 +410,7 @@ f_mapping: dict[bytes, CommandProtocol] = {
     b"REPLCONF": replconf_command,
     b"PSYNC": psync_command,
     b"SELECT": select_command,
+    b"WAIT": wait_command,
 }
 
 
