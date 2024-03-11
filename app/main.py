@@ -270,9 +270,8 @@ class Storage:
             if result_inner:
                 result.append([key, result_inner])
         if not result:
-            return NullBulkString()
-        res = encode_array(result)
-        return res
+            return None
+        return result
 
 
 # TODO: use everywhere
@@ -787,15 +786,62 @@ def xread_command(
     command: Command,
     replication_connection: bool,
 ):
-    streams = command.args[0]
+    args = command.args[:]
+    first_arg = args[0]
+    block_ms = None
+    if first_arg.upper() == b"BLOCK":
+        block_ms = int(command.args[1])
+        args = args[2:]
+
+    streams = args[0]
     assert streams.upper() == b"STREAMS"
-    rest = command.args[1:]
+    rest = args[1:]
     assert len(rest) % 2 == 0
     keys = rest[: len(rest) // 2]
     raw_ids = rest[len(rest) // 2 :]
+    print("XREAD", block_ms, keys, raw_ids)
 
     response = store.xread(keys, raw_ids)
-    client.send(response.serialize())
+    if response is not None:
+        client.send(encode_array(response).serialize())
+        return
+    if block_ms is None:
+        client.send(NullBulkString().serialize())
+        return
+    now = datetime.datetime.now(tz=datetime.UTC)
+    end = now + datetime.timedelta(milliseconds=block_ms) if block_ms else None
+    loop.append(
+        functools.partial(
+            xread_command_cont, keys=keys, raw_ids=raw_ids, client=client, end=end
+        )
+    )
+    # print("SCHED")
+
+
+def xread_command_cont(
+    loop: list,
+    store: Storage,
+    params: Params,
+    *,
+    keys: list[bytes],
+    raw_ids: list[bytes],
+    client: Client,
+    end: datetime.datetime | None,
+):
+    response = store.xread(keys, raw_ids)
+    if response is not None:
+        client.send(encode_array(response).serialize())
+        return
+    now = datetime.datetime.now(tz=datetime.UTC)
+    if end is not None and now >= end:
+        client.send(NullBulkString().serialize())
+        return
+    loop.append(
+        functools.partial(
+            xread_command_cont, keys=keys, raw_ids=raw_ids, client=client, end=end
+        )
+    )
+    # print("SCHED")
 
 
 class CommandProtocol(Protocol):
