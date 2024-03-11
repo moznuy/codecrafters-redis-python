@@ -821,7 +821,7 @@ def read_rdb(params: Params) -> Storage:
         if byte == 0xFA:  # AUX
             key, data = _rdb_read_str(data)
             value, data = _rdb_read_str(data)
-            print(key, value)
+            # print(key, value)
             continue
         if byte == 0xFF:  # END
             break
