@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import dataclasses
 import datetime
 import functools
@@ -12,6 +13,9 @@ import select
 import socket
 from typing import Callable
 from typing import Protocol
+
+
+EMPTY_RDB = "UkVESVMwMDEx+glyZWRpcy12ZXIFNy4yLjD6CnJlZGlzLWJpdHPAQPoFY3RpbWXCbQi8ZfoIdXNlZC1tZW3CsMQQAPoIYW9mLWJhc2XAAP/wbjv+wP9aog=="
 
 
 @dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
@@ -106,6 +110,10 @@ class Storage:
             meta=StorageMeta(expire=expire), value=Simple(b=value)
         )
         return SimpleString(s="OK")
+
+    def keys(self):
+        keys = list(self.storage.keys())
+        return Array(a=[BulkString(b=key) for key in keys])
 
 
 def read_next_value(data: bytes) -> tuple[ProtocolItem, bytes, int] | None:
@@ -378,8 +386,7 @@ def psync_command(
     client.send(response)
 
     # TODO: construct properly
-    empty_rdb = "UkVESVMwMDEx+glyZWRpcy12ZXIFNy4yLjD6CnJlZGlzLWJpdHPAQPoFY3RpbWXCbQi8ZfoIdXNlZC1tZW3CsMQQAPoIYW9mLWJhc2XAAP/wbjv+wP9aog=="
-    result = BulkString(b=base64.b64decode(empty_rdb))
+    result = BulkString(b=base64.b64decode(EMPTY_RDB))
     response = result.serialize(trailing=False)
     client.send(response)
     client.replica = True
@@ -514,6 +521,22 @@ def config_command(
     raise NotImplementedError
 
 
+def keys_command(
+    loop: list,
+    store: Storage,
+    params: Params,
+    client: Client,
+    item: ProtocolItem,
+    replication_connection: bool,
+):
+    assert isinstance(item, Array)
+    mask = item.a[1]
+    assert isinstance(mask, BulkString)
+    assert mask.b == b"*"
+    response = store.keys()
+    client.send(response.serialize())
+
+
 class CommandProtocol(Protocol):
     def __call__(
         self,
@@ -538,6 +561,7 @@ f_mapping: dict[bytes, CommandProtocol] = {
     b"SELECT": select_command,
     b"WAIT": wait_command,
     b"CONFIG": config_command,
+    b"KEYS": keys_command,
 }
 
 
@@ -659,11 +683,107 @@ class Params:
     replica_active: bool = True
 
 
+def _rdb_read_length(data: bytes) -> tuple[int, bytes]:
+    byte, data = data[0], data[1:]
+
+    ms2 = (byte & 0b11_00_0000) >> 6
+    if ms2 == 0:
+        return byte & 0b00_11_1111, data
+    if ms2 == 1:
+        length = ((byte & 0b00_11_1111) << 6) | data[0]
+        data = data[1:]
+        return length, data
+    if ms2 == 2:
+        length_raw, data = data[:4], data[4:]
+        length = int.from_bytes(length_raw, "little")
+        return length, data
+    if ms2 == 3:
+        special_format = byte & 0b00_11_1111
+        if special_format == 0:  # 8  bit integer
+            return -1, data
+        if special_format == 1:  # 16 bit integer
+            return -2, data
+        if special_format == 2:  # 32 bit integer
+            return -4, data
+        if special_format == 3:  # LZF compressed string
+            return -10, data
+    raise NotImplementedError
+
+
+def _rdb_read_str(data: bytes) -> tuple[bytes, bytes]:
+    l, data = _rdb_read_length(data)
+    if l > 0:
+        s, data = data[:l], data[l:]
+        return s, data
+    elif abs(l) in [1, 2, 4]:
+        l = abs(l)
+        s, data = data[:l], data[l:]
+        return str(int.from_bytes(s, "little")).encode(), data
+    elif l == -10:  # LZF
+        len_compressed, data = _rdb_read_length(data)
+        len_uncompressed, data = _rdb_read_length(data)
+        compressed, data = data[:len_compressed], data[:len_compressed]
+        raise NotImplementedError  # TODO: LZF
+        return b"", data
+    raise NotImplementedError
+
+
+def read_rdb(params: Params) -> Storage:
+    rdb_store = Storage()
+    data = None
+    with contextlib.suppress(FileNotFoundError):
+        with open(params.dbfilename, "rb") as file:
+            data = file.read()
+    if not data:
+        return rdb_store
+
+    magic, data = data[:5], data[5:]
+    assert magic == b"REDIS"
+    version, data = data[:4], data[4:]
+
+    while data:
+        byte, data = data[0], data[1:]
+        if byte == 0xFA:  # AUX
+            key, data = _rdb_read_str(data)
+            value, data = _rdb_read_str(data)
+            print(key, value)
+            continue
+        if byte == 0xFF:  # END
+            break
+        if byte == 0xFE:  # DATABASE Selector
+            db, data = _rdb_read_length(data)
+            assert db == 0
+            continue
+        if byte == 0xFB:  # RESIZEDB
+            # We do not optimize here :)
+            _hash_table_size, data = _rdb_read_length(data)
+            _expiry_table_size, data = _rdb_read_length(data)
+            continue
+        if 0 <= byte <= 14:  # VALUE TYPE:
+            value_type = byte
+            key, data = _rdb_read_str(data)
+            if value_type == 0:  # String Encoding
+                value, data = _rdb_read_str(data)
+                rdb_store.set(key, value)
+                continue
+
+            print(f"{value_type=}")
+            raise NotImplementedError
+
+        print(f"{byte:02x}")
+        raise NotImplementedError
+
+    print(f"{len(rdb_store.storage)=}")
+    return rdb_store
+
+
 def main():
+    with open("dump.rdb", "wb") as file:
+        file.write(base64.b64decode(EMPTY_RDB))
     parser = argparse.ArgumentParser(
         prog="CodeCrafters Redis Python",
         description="Custom Redis Implementation",
-        epilog="2024 @ Serhii Chaykov",
+        epilog="2024 @ Serhii Charykov",
     )
     parser.add_argument("--port", default=6379, type=int)
     parser.add_argument("--replicaof", nargs="+", default=[])
@@ -686,6 +806,7 @@ def main():
     print(f"Params : {params}")
     print("Starting Redis on port {}".format(params.port))
     os.chdir(params.dir)
+    store = read_rdb(params)
 
     replica = None
     if not params.master:
@@ -701,7 +822,6 @@ def main():
     server_socket = socket.create_server(("localhost", params.port), reuse_port=True)
     server_socket.setblocking(False)
     client_sockets: dict[socket.socket, Client] = {}
-    store = Storage()
 
     while True:
         read_sockets = list(client_sockets)
