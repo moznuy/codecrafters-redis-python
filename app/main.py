@@ -4,10 +4,14 @@ from typing import Any
 
 def serve_client(client_tuple: tuple[socket.socket, Any]):
     client, address = client_tuple
-    data = client.recv(4096)
-    strings = data.split(b'\n')
-    for _ in strings:
-        client.sendall(b"+PONG\r\n")
+    while True:
+        data = client.recv(4096)
+        if not data:
+            break
+        strings = data.split(b'\r\n')
+        pings = sum(1 for string in strings if string == b'ping')
+        for _ in range(pings):
+            client.sendall(b"+PONG\r\n")
     client.close()
 
 
