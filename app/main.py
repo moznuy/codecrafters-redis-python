@@ -132,12 +132,12 @@ class Client:
     data: bytes
 
 
-def ping_command(store: Storage, client: Client, item: ProtocolItem):
+def ping_command(store: Storage, params: Params, client: Client, item: ProtocolItem):
     assert isinstance(item, Array)
     client.socket.sendall(b"+PONG\r\n")  # TODO: implement serialization
 
 
-def echo_command(store: Storage, client: Client, item: ProtocolItem):
+def echo_command(store: Storage, params: Params, client: Client, item: ProtocolItem):
     assert isinstance(item, Array)
     word = item.a[1]
     assert isinstance(word, BulkString)
@@ -146,7 +146,7 @@ def echo_command(store: Storage, client: Client, item: ProtocolItem):
     client.socket.sendall(resp)
 
 
-def get_command(store: Storage, client: Client, item: ProtocolItem):
+def get_command(store: Storage, params: Params, client: Client, item: ProtocolItem):
     assert isinstance(item, Array)
     key = item.a[1]
     assert isinstance(key, BulkString)
@@ -155,7 +155,7 @@ def get_command(store: Storage, client: Client, item: ProtocolItem):
     client.socket.sendall(response)
 
 
-def set_command(store: Storage, client: Client, item: ProtocolItem):
+def set_command(store: Storage, params: Params, client: Client, item: ProtocolItem):
     assert isinstance(item, Array)
     key = item.a[1]
     assert isinstance(key, BulkString)
@@ -178,15 +178,32 @@ def set_command(store: Storage, client: Client, item: ProtocolItem):
     client.socket.sendall(response)
 
 
+def info_command(store: Storage, params: Params, client: Client, item: ProtocolItem):
+    assert isinstance(item, Array)
+    key = item.a[1]
+    assert isinstance(key, BulkString)
+    assert key.b.upper() == b"REPLICATION"
+    role = "master" if params.master else "slave"
+    result = BulkString(
+        b=f"""\
+# Replication
+role:{role}
+""".encode()
+    )
+    response = result.serialize()
+    client.socket.sendall(response)
+
+
 f_mapping = {
     b"PING": ping_command,
     b"ECHO": echo_command,
     b"GET": get_command,
     b"SET": set_command,
+    b"INFO": info_command,
 }
 
 
-def serve_client(store: Storage, client: Client):
+def serve_client(store: Storage, params: Params, client: Client):
     while True:
         if not client.data:
             break
@@ -205,15 +222,21 @@ def serve_client(store: Storage, client: Client):
         if f is None:
             raise NotImplementedError
 
-        f(store, client, item)
+        f(store, params, client, item)
+
+
+@dataclasses.dataclass(kw_only=True, slots=True)
+class Params:
+    master: bool = True
 
 
 def main():
     parser = argparse.ArgumentParser(
-        prog='CodeCrafters Redis Python',
-        description='Custom Redis Implementation',
-        epilog='2024 @ Serhii Chaykov')
-    parser.add_argument('-p', '--port', default=6379, type=int)
+        prog="CodeCrafters Redis Python",
+        description="Custom Redis Implementation",
+        epilog="2024 @ Serhii Chaykov",
+    )
+    parser.add_argument("-p", "--port", default=6379, type=int)
     args = parser.parse_args()
     print("Starting Redis on port {}".format(args.port))
 
@@ -221,6 +244,7 @@ def main():
     server_socket.setblocking(False)
     client_sockets: dict[socket.socket, Client] = {}
     store = Storage()
+    params = Params()
 
     while True:
         read_sockets = [server_socket] + list(client_sockets)
@@ -239,7 +263,7 @@ def main():
 
             client = client_sockets[sock]
             client.data += recv
-            serve_client(store, client)
+            serve_client(store, params, client)
 
 
 if __name__ == "__main__":
