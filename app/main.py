@@ -204,12 +204,23 @@ master_repl_offset:{params.master_repl_offset}
     client.socket.sendall(response)
 
 
+def replconf_command(
+    store: Storage, params: Params, client: Client, item: ProtocolItem
+):
+    assert isinstance(item, Array)
+    # TODO: do somthing with params
+    result = SimpleString(s="OK")
+    response = result.serialize()
+    client.socket.sendall(response)
+
+
 f_mapping = {
     b"PING": ping_command,
     b"ECHO": echo_command,
     b"GET": get_command,
     b"SET": set_command,
     b"INFO": info_command,
+    b"REPLCONF": replconf_command,
 }
 
 
