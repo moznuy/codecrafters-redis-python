@@ -97,16 +97,18 @@ class Storage:
         return SimpleString(s="OK")
 
 
-def read_next_value(data: bytes) -> tuple[ProtocolItem, bytes] | None:
+def read_next_value(data: bytes) -> tuple[ProtocolItem, bytes, int] | None:
     assert data
 
     byte, data = data[:1], data[1:]
+    parsed = 1
     if byte == b"+":  # Simple String
         index = data.find(b"\r\n")
         if index == -1:  # Not enough data
             return None
         raw_string, data = data[:index], data[index + 2 :]
-        return SimpleString(s=raw_string.decode()), data
+        parsed += index + 2
+        return SimpleString(s=raw_string.decode()), data, parsed
 
     if byte == b"$":  # Bulk String
         index = data.find(b"\r\n")
@@ -118,8 +120,9 @@ def read_next_value(data: bytes) -> tuple[ProtocolItem, bytes] | None:
             return None
         s = data[index + 2 : index2]
         data = data[index2 + 2 :]
+        parsed += index2 + 2
         assert length == len(s)  # TODO: protocol error
-        return BulkString(b=s), data
+        return BulkString(b=s), data, parsed
 
     if byte == b"*":  # Array
         index = data.find(b"\r\n")
@@ -128,33 +131,40 @@ def read_next_value(data: bytes) -> tuple[ProtocolItem, bytes] | None:
         length = int(data[:index])  # TODO: protocol error
         res = Array(a=[])
         data = data[index + 2 :]
+        parsed += index + 2
         for _ in range(length):
             result = read_next_value(data)
             if result is None:  # Not enough data
                 return None
-            item, data = result
+            item, data, tmp_parsed = result
+            parsed += tmp_parsed
             res.a.append(item)
-        return res, data
+        return res, data, parsed
 
     raise NotImplementedError
 
 
-def read_next_value_rdb(data: bytes) -> tuple[ProtocolItem, bytes] | None:
+def read_next_value_rdb(data: bytes) -> tuple[ProtocolItem, bytes, int] | None:
     assert data
 
     # TODO: duplicate code
     byte, data = data[:1], data[1:]
+    parsed = 1
     if byte == b"$":  # Bulk String
         index = data.find(b"\r\n")
         if index == -1:  # Not enough data
             return None
         length = int(data[:index])  # TODO: protocol error
         data = data[index + 2 :]
+        parsed += index + 2
         s, data = data[:length], data[length:]
         if len(s) != length:  # Not enough data
             return None
-        return BulkString(b=s), data
+        return BulkString(b=s), data, parsed
 
+    # TODO: determine why sometimes this fails with actual redis
+    # Something missing in packets concat/divide
+    print(byte + data)
     raise NotImplementedError
 
 
@@ -292,7 +302,7 @@ def replconf_command(
             a=[
                 BulkString(b=b"REPLCONF"),
                 BulkString(b=b"ACK"),
-                BulkString(b=str(0).encode()),
+                BulkString(b=str(params.replica_offset).encode()),
             ]
         )
         response = result.serialize()
@@ -384,7 +394,7 @@ def serve_client(store: Storage, params: Params, client: Client):
         if result is None:
             break
 
-        item, client.data = result
+        item, client.data, parsed = result
         assert isinstance(item, Array)
         command = item.a[0]
         assert isinstance(command, BulkString)
@@ -409,12 +419,13 @@ def serve_master(store: Storage, params: Params, client: Client):
         if result is None:
             break
 
-        item, client.data = result
+        item, client.data, parsed = result
         if params.replica_flow < 4:
             assert isinstance(item, SimpleString)
         elif params.replica_flow == 4:
             # TODO: apply rdb from master
             assert isinstance(item, BulkString)
+            params.replica_offset = 0
         else:  # REPLICATION is ESTABLISHED PARSE AS CLIENT BUT DO NOT RESPOND
             # TODO: code duplication
             assert isinstance(item, Array)
@@ -426,8 +437,16 @@ def serve_master(store: Storage, params: Params, client: Client):
             if f is None:
                 raise NotImplementedError
 
-            print("REPLICATION:", item)
+            print(
+                "REPLICATION:",
+                params.replica_offset,
+                parsed,
+                params.replica_offset + parsed,
+                item,
+            )
             f(store, params, client, item, replication_connection=True)
+            params.replica_offset += parsed
+            # client.socket.sendall(Array(a=[BulkString(b=b"PING")]).serialize())
             continue
 
         params.replica_flow += 1
