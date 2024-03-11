@@ -6,6 +6,7 @@ import contextlib
 import dataclasses
 import datetime
 import functools
+import itertools
 import logging
 import os
 import random
@@ -90,6 +91,15 @@ class Simple(StorageValue):
 
 
 @dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
+class Stream(StorageValue):
+    s: dict[bytes, dict[bytes, bytes]]
+
+    @staticmethod
+    def type():
+        return SimpleString(s="stream")
+
+
+@dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
 class StorageItem:
     meta: StorageMeta
     value: StorageValue
@@ -142,6 +152,14 @@ class Storage:
 
         item = self.storage[key]
         return item.value.type()
+
+    def xadd(self, key: bytes, identifier: bytes, tuples: list):
+        value = self.storage.setdefault(
+            key, StorageItem(meta=StorageMeta(), value=Stream(s={}))
+        ).value
+        assert isinstance(value, Stream)  # TODO: wrong type
+        value.s[identifier] = dict(tuples)
+        return BulkString(b=identifier)
 
 
 def read_next_value(data: bytes) -> tuple[ProtocolItem, bytes, int] | None:
@@ -234,10 +252,9 @@ def ping_command(
     store: Storage,
     params: Params,
     client: Client,
-    item: ProtocolItem,
+    command: Command,
     replication_connection: bool,
 ):
-    assert isinstance(item, Array)
     if replication_connection:
         return
     client.send(b"+PONG\r\n")  # TODO: implement serialization
@@ -248,16 +265,14 @@ def echo_command(
     store: Storage,
     params: Params,
     client: Client,
-    item: ProtocolItem,
+    command: Command,
     replication_connection: bool,
 ):
-    assert isinstance(item, Array)
-    word = item.a[1]
-    assert isinstance(word, BulkString)
+    word = command.args[0]
     if replication_connection:
         return
     # TODO: implement serialization
-    resp = b"$" + str(len(word.b)).encode() + b"\r\n" + word.b + b"\r\n"
+    resp = b"$" + str(len(word)).encode() + b"\r\n" + word + b"\r\n"
     client.send(resp)
 
 
@@ -266,13 +281,11 @@ def get_command(
     store: Storage,
     params: Params,
     client: Client,
-    item: ProtocolItem,
+    command: Command,
     replication_connection: bool,
 ):
-    assert isinstance(item, Array)
-    key = item.a[1]
-    assert isinstance(key, BulkString)
-    result = store.get(key.b)
+    key = command.args[0]
+    result = store.get(key)
     if replication_connection:
         return
     response = result.serialize()
@@ -284,33 +297,28 @@ def set_command(
     store: Storage,
     params: Params,
     client: Client,
-    item: ProtocolItem,
+    command: Command,
     replication_connection: bool,
 ):
-    assert isinstance(item, Array)
-    key = item.a[1]
-    assert isinstance(key, BulkString)
-    value = item.a[2]
-    assert isinstance(value, BulkString)
+    key = command.args[0]
+    value = command.args[1]
     expire = None
 
-    if len(item.a) > 3:
-        assert isinstance(item.a[3], BulkString)
-        assert item.a[3].b.upper() == b"PX"
+    if len(command.args) > 2:
+        assert command.args[2].upper() == b"PX"
 
-        assert isinstance(item.a[4], BulkString)
-        ms = int(item.a[4].b)
+        ms = int(command.args[3])
         expire = datetime.datetime.now(tz=datetime.UTC) + datetime.timedelta(
             milliseconds=ms
         )
 
-    result = store.set(key.b, value.b, expire)
+    result = store.set(key, value, expire)
     if replication_connection:
         return
     response = result.serialize()
     client.send(response)
 
-    propagate = item.serialize()
+    propagate = command.resp3().serialize()
     if params.master_replicas:
         print("Propagation to replicas:", propagate)
     for replica in params.master_replicas:
@@ -322,13 +330,11 @@ def info_command(
     store: Storage,
     params: Params,
     client: Client,
-    item: ProtocolItem,
+    command: Command,
     replication_connection: bool,
 ):
-    assert isinstance(item, Array)
-    key = item.a[1]
-    assert isinstance(key, BulkString)
-    assert key.b.upper() == b"REPLICATION"
+    key = command.args[0]
+    assert key.upper() == b"REPLICATION"
     if replication_connection:
         return
     role = "master" if params.master else "slave"
@@ -349,15 +355,11 @@ def replconf_command(
     store: Storage,
     params: Params,
     client: Client,
-    item: ProtocolItem,
+    command: Command,
     replication_connection: bool,
 ):
-    assert isinstance(item, Array)
-    name = item.a[1]
-    value = item.a[2]
-    assert isinstance(name, BulkString)
-    assert isinstance(value, BulkString)
-    method = name.b.upper()
+    value = command.args[1]
+    method = command.args[0].upper()
 
     if method == b"GETACK":
         result = Array(
@@ -371,7 +373,7 @@ def replconf_command(
         client.send(response)
         return
     if method == b"ACK":
-        remote_offset = int(value.b)
+        remote_offset = int(value)
         client.last_offset = remote_offset
         print("REMOTE OFFSET", remote_offset)
         return
@@ -391,17 +393,14 @@ def psync_command(
     store: Storage,
     params: Params,
     client: Client,
-    item: ProtocolItem,
+    command: Command,
     replication_connection: bool,
 ):
-    assert isinstance(item, Array)
-    repl_id = item.a[1]
-    assert isinstance(repl_id, BulkString)
-    repl_offset = item.a[2]
-    assert isinstance(repl_offset, BulkString)
-    print("REPLICA: PSYNC", repl_id.b, repl_offset.b)
-    assert repl_id.b.decode() == "?"
-    assert int(repl_offset.b) == -1
+    repl_id = command.args[0]
+    repl_offset = command.args[1]
+    print("REPLICA: PSYNC", repl_id, repl_offset)
+    assert repl_id == b"?"
+    assert int(repl_offset) == -1
 
     if replication_connection:
         return
@@ -427,7 +426,7 @@ def select_command(
     store: Storage,
     params: Params,
     client: Client,
-    item: ProtocolItem,
+    command: Command,
     replication_connection: bool,
 ):
     # TODO: implement
@@ -439,16 +438,11 @@ def wait_command(
     store: Storage,
     params: Params,
     client: Client,
-    item: ProtocolItem,
+    command: Command,
     replication_connection: bool,
 ):
-    assert isinstance(item, Array)
-    replicas_raw = item.a[1]
-    wait_ms_raw = item.a[2]
-    assert isinstance(replicas_raw, BulkString)
-    assert isinstance(wait_ms_raw, BulkString)
-    replicas = int(replicas_raw.b)
-    wait_ms = int(wait_ms_raw.b)
+    replicas = int(command.args[0])
+    wait_ms = int(command.args[1])
 
     # print("MASTER WAIT", replicas, wait_ms)
     ready = sum(
@@ -517,16 +511,13 @@ def config_command(
     store: Storage,
     params: Params,
     client: Client,
-    item: ProtocolItem,
+    command: Command,
     replication_connection: bool,
 ):
-    assert isinstance(item, Array)
-    method = item.a[1]
-    item = item.a[2]
-    assert isinstance(method, BulkString)
-    assert isinstance(item, BulkString)
-    assert method.b.upper() == b"GET"
-    if item.b == b"dir":
+    method = command.args[0]
+    item = command.args[1]
+    assert method.upper() == b"GET"
+    if item == b"dir":
         response = Array(
             a=[
                 BulkString(b=b"dir"),
@@ -535,7 +526,7 @@ def config_command(
         )
         client.send(response.serialize())
         return
-    if item.b == b"dbfilename":
+    if item == b"dbfilename":
         response = Array(
             a=[
                 BulkString(b=b"dbfilename"),
@@ -554,13 +545,11 @@ def keys_command(
     store: Storage,
     params: Params,
     client: Client,
-    item: ProtocolItem,
+    command: Command,
     replication_connection: bool,
 ):
-    assert isinstance(item, Array)
-    mask = item.a[1]
-    assert isinstance(mask, BulkString)
-    assert mask.b == b"*"
+    mask = command.args[0]
+    assert mask == b"*"
     response = store.keys()
     client.send(response.serialize())
 
@@ -570,13 +559,61 @@ def type_command(
     store: Storage,
     params: Params,
     client: Client,
-    item: ProtocolItem,
+    command: Command,
     replication_connection: bool,
 ):
+    key = command.args[0]
+    response = store.type(key)
+    client.send(response.serialize())
+
+
+@dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
+class Command:
+    command: bytes
+    args: list[bytes]
+
+    def resp3(self):
+        arr = [BulkString(b=self.command)] + [BulkString(b=arg) for arg in self.args]
+        return Array(a=arr)
+
+
+def parse_command(item: ProtocolItem) -> Command:
     assert isinstance(item, Array)
-    key = item.a[1]
-    assert isinstance(key, BulkString)
-    response = store.type(key.b)
+
+    command = b""
+    args: list[bytes] = []
+    for i in item.a:
+        assert isinstance(i, BulkString)
+        if not command:
+            command = i.b
+            continue
+        args.append(i.b)
+
+    return Command(command=command, args=args)
+
+
+def batched(lst, n):
+    it = iter(lst)
+    return iter(lambda: tuple(itertools.islice(it, n)), ())
+
+
+def xadd_command(
+    loop: list,
+    store: Storage,
+    params: Params,
+    client: Client,
+    command: Command,
+    replication_connection: bool,
+):
+    key = command.args[0]
+    identifier = command.args[1]
+
+    tuples = []
+    # TODO 3.12 batched
+    for tuple_ in batched(command.args[2:], n=2):
+        print(tuple_)
+
+    response = store.xadd(key, identifier, tuples)
     client.send(response.serialize())
 
 
@@ -587,7 +624,7 @@ class CommandProtocol(Protocol):
         store: Storage,
         params: Params,
         client: Client,
-        item: ProtocolItem,
+        command: Command,
         replication_connection: bool,
     ):
         ...
@@ -606,6 +643,7 @@ f_mapping: dict[bytes, CommandProtocol] = {
     b"CONFIG": config_command,
     b"KEYS": keys_command,
     b"TYPE": type_command,
+    b"XADD": xadd_command,
 }
 
 
@@ -619,16 +657,12 @@ def serve_client(loop: list, store: Storage, params: Params, client: Client):
             break
 
         item, client.data, parsed = result
-        assert isinstance(item, Array)
-        command = item.a[0]
-        assert isinstance(command, BulkString)
-        com = command.b.upper()
-
-        f = f_mapping.get(com)
+        command = parse_command(item)
+        f = f_mapping.get(command.command.upper())
         if f is None:
             raise NotImplementedError
 
-        f(loop, store, params, client, item, replication_connection=False)
+        f(loop, store, params, client, command, replication_connection=False)
         # params.master_repl_offset += parsed
 
 
@@ -653,12 +687,8 @@ def serve_master(loop: list, store: Storage, params: Params, client: Client):
             params.replica_offset = 0
         else:  # REPLICATION is ESTABLISHED PARSE AS CLIENT BUT DO NOT RESPOND
             # TODO: code duplication
-            assert isinstance(item, Array)
-            command = item.a[0]
-            assert isinstance(command, BulkString)
-            com = command.b.upper()
-
-            f = f_mapping.get(com)
+            command = parse_command(item)
+            f = f_mapping.get(command.command.upper())
             if f is None:
                 raise NotImplementedError
 
@@ -669,13 +699,13 @@ def serve_master(loop: list, store: Storage, params: Params, client: Client):
                 params.replica_offset + parsed,
                 item,
             )
-            f(loop, store, params, client, item, replication_connection=True)
+            f(loop, store, params, client, command, replication_connection=True)
             params.replica_offset += parsed
             # client.send(Array(a=[BulkString(b=b"PING")]).serialize())
             continue
 
         params.replica_flow += 1
-        print("FROM MASTER:", params.replica_flow, item)
+        # print("FROM MASTER:", params.replica_flow, item)
         if params.replica_flow == 1:
             data = Array(
                 a=[
