@@ -249,6 +249,31 @@ class Storage:
                 result.append(Array(a=[encode_xid(xid), encode_array(items)]))
         return Array(a=result)
 
+    def xread(self, keys: list[bytes], raw_ids: list[bytes]):
+        key: bytes
+        raw_ids: bytes
+
+        result = []
+        for key, raw_id in zip(keys, raw_ids, strict=True):
+            start = self._get_seq(raw_id, 0)
+
+            val = self.storage.get(key)
+            if val is None:
+                continue
+            stream = val.value
+            assert isinstance(stream, Stream)
+
+            result_inner = []
+            for xid, items in stream.s:
+                if start < xid:  # TODO: binary search
+                    result_inner.append([encode_xid(xid), items])
+            if result_inner:
+                result.append([key, result_inner])
+        if not result:
+            return NullBulkString()
+        res = encode_array(result)
+        return res
+
 
 # TODO: use everywhere
 def encode_int(n: int) -> BulkString:
@@ -267,6 +292,9 @@ def encode_array(a: list) -> Array:
     assert isinstance(a, list)
     res = []
     for x in a:
+        if isinstance(x, BulkString):
+            res.append(x)
+            continue
         if isinstance(x, bytes):
             res.append(BulkString(b=x))
             continue
@@ -274,6 +302,9 @@ def encode_array(a: list) -> Array:
             for i in x:
                 assert isinstance(i, bytes)
                 res.append(BulkString(b=i))
+            continue
+        if isinstance(x, list):
+            res.append(encode_array(x))
             continue
         print(x)
         raise NotImplementedError
@@ -748,6 +779,25 @@ def xrange_command(
     client.send(response.serialize())
 
 
+def xread_command(
+    loop: list,
+    store: Storage,
+    params: Params,
+    client: Client,
+    command: Command,
+    replication_connection: bool,
+):
+    streams = command.args[0]
+    assert streams.upper() == b"STREAMS"
+    rest = command.args[1:]
+    assert len(rest) % 2 == 0
+    keys = rest[: len(rest) // 2]
+    raw_ids = rest[len(rest) // 2 :]
+
+    response = store.xread(keys, raw_ids)
+    client.send(response.serialize())
+
+
 class CommandProtocol(Protocol):
     def __call__(
         self,
@@ -776,6 +826,7 @@ f_mapping: dict[bytes, CommandProtocol] = {
     b"TYPE": type_command,
     b"XADD": xadd_command,
     b"XRANGE": xrange_command,
+    b"XREAD": xread_command,
 }
 
 
