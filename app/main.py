@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import collections
 import contextlib
 import dataclasses
 import datetime
@@ -31,6 +32,16 @@ class SimpleString(ProtocolItem):
 
     def serialize(self) -> bytes:
         return b"+" + self.s.encode() + b"\r\n"
+
+
+@dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
+class SimpleError(ProtocolItem):
+    e: str = ""
+    m: str = ""
+
+    def serialize(self) -> bytes:
+        err = (self.e + " " + self.m) if self.e else self.m
+        return b"-" + err.encode() + b"\r\n"
 
 
 @dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
@@ -92,7 +103,7 @@ class Simple(StorageValue):
 
 @dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
 class Stream(StorageValue):
-    s: dict[bytes, dict[bytes, bytes]]
+    s: list[tuple[XID, dict[bytes, bytes]]]
 
     @staticmethod
     def type():
@@ -103,6 +114,9 @@ class Stream(StorageValue):
 class StorageItem:
     meta: StorageMeta
     value: StorageValue
+
+
+XID = collections.namedtuple("XID", ["time", "seq"])
 
 
 class Storage:
@@ -153,13 +167,38 @@ class Storage:
         item = self.storage[key]
         return item.value.type()
 
-    def xadd(self, key: bytes, identifier: bytes, tuples: list):
+    @staticmethod
+    def x_validate_id(s: Stream, new_id: XID) -> SimpleError | None:
+        try:
+            last_id = s.s[-1][0]
+        except IndexError:
+            last_id = XID(0, 0)
+
+        if new_id <= XID(0, 0):
+            return SimpleError(
+                e="ERR",
+                m="The ID specified in XADD must be greater than 0-0",
+            )
+
+        if new_id <= last_id:
+            return SimpleError(
+                e="ERR",
+                m="The ID specified in XADD is equal or smaller than the target stream top item",
+            )
+        return None
+
+    def xadd(self, key: bytes, xid: XID, tuples: list):
         value = self.storage.setdefault(
-            key, StorageItem(meta=StorageMeta(), value=Stream(s={}))
+            key, StorageItem(meta=StorageMeta(), value=Stream(s=[]))
         ).value
         assert isinstance(value, Stream)  # TODO: wrong type
-        value.s[identifier] = dict(tuples)
-        return BulkString(b=identifier)
+
+        err = self.x_validate_id(value, xid)
+        if err is not None:
+            return err
+
+        value.s.append((xid, dict(tuples)))
+        return BulkString(b=f"{xid.time}-{xid.seq}".encode())
 
 
 def read_next_value(data: bytes) -> tuple[ProtocolItem, bytes, int] | None:
@@ -597,6 +636,9 @@ def batched(lst, n):
     return iter(lambda: tuple(itertools.islice(it, n)), ())
 
 
+GGG = 0
+
+
 def xadd_command(
     loop: list,
     store: Storage,
@@ -605,15 +647,23 @@ def xadd_command(
     command: Command,
     replication_connection: bool,
 ):
+    global GGG
+    GGG += 1
     key = command.args[0]
-    identifier = command.args[1]
+    id_raw = command.args[1]
+    if id_raw == "*":
+        ident = XID(0, GGG)
+    else:
+        time_raw, seq_raw = id_raw.split(b"-")
+        time, seq = int(time_raw), int(seq_raw)
+        ident = XID(time, seq)
 
     tuples = []
     # TODO 3.12 batched
     for tuple_ in batched(command.args[2:], n=2):
         print(tuple_)
 
-    response = store.xadd(key, identifier, tuples)
+    response = store.xadd(key, ident, tuples)
     client.send(response.serialize())
 
 
