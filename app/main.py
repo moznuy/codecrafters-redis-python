@@ -193,6 +193,21 @@ class Storage:
         ).value
         assert isinstance(value, Stream)  # TODO: wrong type
 
+        assert xid.time != -1
+        if xid.seq == -1:
+            try:
+                last_time = value.s[-1][0].time
+                last_seq = value.s[-1][0].seq
+
+                if last_time == xid.time:
+                    xid = XID(xid.time, last_seq + 1)
+                elif xid.time > 0:
+                    xid = XID(xid.time, 0)
+                else:
+                    xid = XID(0, 1)
+            except IndexError:
+                xid = XID(0, 1)
+
         err = self.x_validate_id(value, xid)
         if err is not None:
             return err
@@ -652,11 +667,15 @@ def xadd_command(
     key = command.args[0]
     id_raw = command.args[1]
     if id_raw == "*":
-        ident = XID(0, GGG)
+        ident = XID(-1, -1)
     else:
         time_raw, seq_raw = id_raw.split(b"-")
-        time, seq = int(time_raw), int(seq_raw)
-        ident = XID(time, seq)
+        if seq_raw == b"*":
+            time, seq = int(time_raw), -1
+            ident = XID(time, seq)
+        else:
+            time, seq = int(time_raw), int(seq_raw)
+            ident = XID(time, seq)
 
     tuples = []
     # TODO 3.12 batched
