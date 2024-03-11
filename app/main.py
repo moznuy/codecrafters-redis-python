@@ -165,21 +165,29 @@ class Client:
 
 
 def ping_command(
-    store: Storage, params: Params, client: Client, item: ProtocolItem, respond: bool
+    store: Storage,
+    params: Params,
+    client: Client,
+    item: ProtocolItem,
+    replication_connection: bool,
 ):
     assert isinstance(item, Array)
-    if not respond:
+    if replication_connection:
         return
     client.socket.sendall(b"+PONG\r\n")  # TODO: implement serialization
 
 
 def echo_command(
-    store: Storage, params: Params, client: Client, item: ProtocolItem, respond: bool
+    store: Storage,
+    params: Params,
+    client: Client,
+    item: ProtocolItem,
+    replication_connection: bool,
 ):
     assert isinstance(item, Array)
     word = item.a[1]
     assert isinstance(word, BulkString)
-    if not respond:
+    if replication_connection:
         return
     # TODO: implement serialization
     resp = b"$" + str(len(word.b)).encode() + b"\r\n" + word.b + b"\r\n"
@@ -187,20 +195,28 @@ def echo_command(
 
 
 def get_command(
-    store: Storage, params: Params, client: Client, item: ProtocolItem, respond: bool
+    store: Storage,
+    params: Params,
+    client: Client,
+    item: ProtocolItem,
+    replication_connection: bool,
 ):
     assert isinstance(item, Array)
     key = item.a[1]
     assert isinstance(key, BulkString)
     result = store.get(key.b)
-    if not respond:
+    if replication_connection:
         return
     response = result.serialize()
     client.socket.sendall(response)
 
 
 def set_command(
-    store: Storage, params: Params, client: Client, item: ProtocolItem, respond: bool
+    store: Storage,
+    params: Params,
+    client: Client,
+    item: ProtocolItem,
+    replication_connection: bool,
 ):
     assert isinstance(item, Array)
     key = item.a[1]
@@ -220,7 +236,7 @@ def set_command(
         )
 
     result = store.set(key.b, value.b, expire)
-    if not respond:
+    if replication_connection:
         return
     response = result.serialize()
     client.socket.sendall(response)
@@ -233,13 +249,17 @@ def set_command(
 
 
 def info_command(
-    store: Storage, params: Params, client: Client, item: ProtocolItem, respond: bool
+    store: Storage,
+    params: Params,
+    client: Client,
+    item: ProtocolItem,
+    replication_connection: bool,
 ):
     assert isinstance(item, Array)
     key = item.a[1]
     assert isinstance(key, BulkString)
     assert key.b.upper() == b"REPLICATION"
-    if not respond:
+    if replication_connection:
         return
     role = "master" if params.master else "slave"
     result = BulkString(
@@ -255,19 +275,44 @@ master_repl_offset:{params.master_repl_offset}
 
 
 def replconf_command(
-    store: Storage, params: Params, client: Client, item: ProtocolItem, respond: bool
+    store: Storage,
+    params: Params,
+    client: Client,
+    item: ProtocolItem,
+    replication_connection: bool,
 ):
     assert isinstance(item, Array)
-    # TODO: do somthing with params
-    if not respond:
-        return
-    result = SimpleString(s="OK")
-    response = result.serialize()
-    client.socket.sendall(response)
+    name = item.a[1]
+    value = item.a[2]
+    assert isinstance(name, BulkString)
+    assert isinstance(value, BulkString)
+
+    if name.b.upper() == b"GETACK":
+        result = Array(
+            a=[
+                BulkString(b=b"REPLCONF"),
+                BulkString(b=b"ACK"),
+                BulkString(b=str(0).encode()),
+            ]
+        )
+        response = result.serialize()
+        client.socket.sendall(response)
+
+    elif name.b.upper() in [b"SETACK", b"LISTENING-PORT", b"CAPA"]:
+        result = SimpleString(s="OK")
+        response = result.serialize()
+        client.socket.sendall(response)
+    else:
+        print(name.b.upper())
+        raise NotImplementedError
 
 
 def psync_command(
-    store: Storage, params: Params, client: Client, item: ProtocolItem, respond: bool
+    store: Storage,
+    params: Params,
+    client: Client,
+    item: ProtocolItem,
+    replication_connection: bool,
 ):
     assert isinstance(item, Array)
     repl_id = item.a[1]
@@ -278,7 +323,7 @@ def psync_command(
     assert repl_id.b.decode() == "?"
     assert int(repl_offset.b) == -1
 
-    if not respond:
+    if replication_connection:
         return
 
     result = SimpleString(
@@ -296,7 +341,11 @@ def psync_command(
 
 
 def select_command(
-    store: Storage, params: Params, client: Client, item: ProtocolItem, respond: bool
+    store: Storage,
+    params: Params,
+    client: Client,
+    item: ProtocolItem,
+    replication_connection: bool,
 ):
     # TODO: implement
     pass
@@ -309,7 +358,7 @@ class CommandProtocol(Protocol):
         params: Params,
         client: Client,
         item: ProtocolItem,
-        respond: bool,
+        replication_connection: bool,
     ):
         ...
 
@@ -345,7 +394,7 @@ def serve_client(store: Storage, params: Params, client: Client):
         if f is None:
             raise NotImplementedError
 
-        f(store, params, client, item, respond=True)
+        f(store, params, client, item, replication_connection=False)
 
 
 def serve_master(store: Storage, params: Params, client: Client):
@@ -378,7 +427,7 @@ def serve_master(store: Storage, params: Params, client: Client):
                 raise NotImplementedError
 
             print("REPLICATION:", item)
-            f(store, params, client, item, respond=False)
+            f(store, params, client, item, replication_connection=True)
             continue
 
         params.replica_flow += 1
