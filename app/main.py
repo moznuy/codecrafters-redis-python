@@ -245,7 +245,7 @@ def psync_command(store: Storage, params: Params, client: Client, item: Protocol
     result = BulkString(b=base64.b64decode(empty_rdb))
     response = result.serialize(trailing=False)
     client.socket.sendall(response)
-    params.master_replicas.append(client)
+    params.master_replicas.append(client)  # TODO: remove on disconnect
 
 
 f_mapping = {
