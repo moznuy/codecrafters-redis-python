@@ -245,16 +245,40 @@ def serve_master(store: Storage, params: Params, client: Client):
 
         item, client.data = result
         print("FROM MASTER:", item)
+        assert isinstance(item, SimpleString)
+        params.replica_flow += 1
+        if params.replica_flow == 1:
+            ping = Array(
+                a=[
+                    BulkString(b=b"REPLCONF"),
+                    BulkString(b=b"listening-port"),
+                    BulkString(b=str(params.port).encode()),
+                ]
+            )
+            payload = ping.serialize()
+            client.socket.sendall(payload)
+        if params.replica_flow == 2:
+            ping = Array(
+                a=[
+                    BulkString(b=b"REPLCONF"),
+                    BulkString(b=b"capa"),
+                    BulkString(b=b"psync2"),
+                ]
+            )
+            payload = ping.serialize()
+            client.socket.sendall(payload)
 
 
 @dataclasses.dataclass(kw_only=True, slots=True)
 class Params:
+    port: int = 0
     master: bool = True
     master_replid: str = ""
     master_repl_offset: int = 0
 
     master_host: str = ""
     master_port: int = 0
+    replica_flow: int = 0
 
 
 def main():
@@ -266,7 +290,7 @@ def main():
     parser.add_argument("--port", default=6379, type=int)
     parser.add_argument("--replicaof", nargs="+", default=[])
     args = parser.parse_args()
-    params = Params(master_replid=random.randbytes(20).hex())
+    params = Params(master_replid=random.randbytes(20).hex(), port=args.port)
 
     if args.replicaof:
         params.master = False
@@ -274,7 +298,7 @@ def main():
         params.master_port = int(args.replicaof[1])
 
     print(f"Params : {params}")
-    print("Starting Redis on port {}".format(args.port))
+    print("Starting Redis on port {}".format(params.port))
 
     replica = None
     if not params.master:
@@ -287,7 +311,7 @@ def main():
         replica_socket.sendall(payload)
         replica = Client(socket=replica_socket, data=b"")
 
-    server_socket = socket.create_server(("localhost", args.port), reuse_port=True)
+    server_socket = socket.create_server(("localhost", params.port), reuse_port=True)
     server_socket.setblocking(False)
     client_sockets: dict[socket.socket, Client] = {}
     store = Storage()
