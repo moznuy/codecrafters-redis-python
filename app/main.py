@@ -8,6 +8,7 @@ import logging
 import random
 import select
 import socket
+from typing import Protocol
 
 
 @dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
@@ -138,36 +139,69 @@ def read_next_value(data: bytes) -> tuple[ProtocolItem, bytes] | None:
     raise NotImplementedError
 
 
+def read_next_value_rdb(data: bytes) -> tuple[ProtocolItem, bytes] | None:
+    assert data
+
+    # TODO: duplicate code
+    byte, data = data[:1], data[1:]
+    if byte == b"$":  # Bulk String
+        index = data.find(b"\r\n")
+        if index == -1:  # Not enough data
+            return None
+        length = int(data[:index])  # TODO: protocol error
+        data = data[index + 2 :]
+        s, data = data[:length], data[length:]
+        if len(s) != length:  # Not enough data
+            return None
+        return BulkString(b=s), data
+
+    raise NotImplementedError
+
+
 @dataclasses.dataclass(kw_only=True, slots=True)
 class Client:
     socket: socket.socket
     data: bytes
 
 
-def ping_command(store: Storage, params: Params, client: Client, item: ProtocolItem):
+def ping_command(
+    store: Storage, params: Params, client: Client, item: ProtocolItem, respond: bool
+):
     assert isinstance(item, Array)
+    if not respond:
+        return
     client.socket.sendall(b"+PONG\r\n")  # TODO: implement serialization
 
 
-def echo_command(store: Storage, params: Params, client: Client, item: ProtocolItem):
+def echo_command(
+    store: Storage, params: Params, client: Client, item: ProtocolItem, respond: bool
+):
     assert isinstance(item, Array)
     word = item.a[1]
     assert isinstance(word, BulkString)
+    if not respond:
+        return
     # TODO: implement serialization
     resp = b"$" + str(len(word.b)).encode() + b"\r\n" + word.b + b"\r\n"
     client.socket.sendall(resp)
 
 
-def get_command(store: Storage, params: Params, client: Client, item: ProtocolItem):
+def get_command(
+    store: Storage, params: Params, client: Client, item: ProtocolItem, respond: bool
+):
     assert isinstance(item, Array)
     key = item.a[1]
     assert isinstance(key, BulkString)
     result = store.get(key.b)
+    if not respond:
+        return
     response = result.serialize()
     client.socket.sendall(response)
 
 
-def set_command(store: Storage, params: Params, client: Client, item: ProtocolItem):
+def set_command(
+    store: Storage, params: Params, client: Client, item: ProtocolItem, respond: bool
+):
     assert isinstance(item, Array)
     key = item.a[1]
     assert isinstance(key, BulkString)
@@ -186,6 +220,8 @@ def set_command(store: Storage, params: Params, client: Client, item: ProtocolIt
         )
 
     result = store.set(key.b, value.b, expire)
+    if not respond:
+        return
     response = result.serialize()
     client.socket.sendall(response)
 
@@ -196,11 +232,15 @@ def set_command(store: Storage, params: Params, client: Client, item: ProtocolIt
         replica.socket.sendall(propagate)
 
 
-def info_command(store: Storage, params: Params, client: Client, item: ProtocolItem):
+def info_command(
+    store: Storage, params: Params, client: Client, item: ProtocolItem, respond: bool
+):
     assert isinstance(item, Array)
     key = item.a[1]
     assert isinstance(key, BulkString)
     assert key.b.upper() == b"REPLICATION"
+    if not respond:
+        return
     role = "master" if params.master else "slave"
     result = BulkString(
         b=f"""\
@@ -215,16 +255,20 @@ master_repl_offset:{params.master_repl_offset}
 
 
 def replconf_command(
-    store: Storage, params: Params, client: Client, item: ProtocolItem
+    store: Storage, params: Params, client: Client, item: ProtocolItem, respond: bool
 ):
     assert isinstance(item, Array)
     # TODO: do somthing with params
+    if not respond:
+        return
     result = SimpleString(s="OK")
     response = result.serialize()
     client.socket.sendall(response)
 
 
-def psync_command(store: Storage, params: Params, client: Client, item: ProtocolItem):
+def psync_command(
+    store: Storage, params: Params, client: Client, item: ProtocolItem, respond: bool
+):
     assert isinstance(item, Array)
     repl_id = item.a[1]
     assert isinstance(repl_id, BulkString)
@@ -233,6 +277,9 @@ def psync_command(store: Storage, params: Params, client: Client, item: Protocol
     print("REPLICA: PSYNC", repl_id.b, repl_offset.b)
     assert repl_id.b.decode() == "?"
     assert int(repl_offset.b) == -1
+
+    if not respond:
+        return
 
     result = SimpleString(
         s=f"FULLRESYNC {params.master_replid} {params.master_repl_offset}"
@@ -248,7 +295,26 @@ def psync_command(store: Storage, params: Params, client: Client, item: Protocol
     params.master_replicas.append(client)  # TODO: remove on disconnect
 
 
-f_mapping = {
+def select_command(
+    store: Storage, params: Params, client: Client, item: ProtocolItem, respond: bool
+):
+    # TODO: implement
+    pass
+
+
+class CommandProtocol(Protocol):
+    def __call__(
+        self,
+        store: Storage,
+        params: Params,
+        client: Client,
+        item: ProtocolItem,
+        respond: bool,
+    ):
+        ...
+
+
+f_mapping: dict[bytes, CommandProtocol] = {
     b"PING": ping_command,
     b"ECHO": echo_command,
     b"GET": get_command,
@@ -256,6 +322,7 @@ f_mapping = {
     b"INFO": info_command,
     b"REPLCONF": replconf_command,
     b"PSYNC": psync_command,
+    b"SELECT": select_command,
 }
 
 
@@ -278,7 +345,7 @@ def serve_client(store: Storage, params: Params, client: Client):
         if f is None:
             raise NotImplementedError
 
-        f(store, params, client, item)
+        f(store, params, client, item, respond=True)
 
 
 def serve_master(store: Storage, params: Params, client: Client):
@@ -286,14 +353,36 @@ def serve_master(store: Storage, params: Params, client: Client):
         if not client.data:
             break
 
-        result = read_next_value(client.data)
+        if params.replica_flow == 4:
+            result = read_next_value_rdb(client.data)
+        else:
+            result = read_next_value(client.data)
         if result is None:
             break
 
         item, client.data = result
-        print("FROM MASTER:", item)
-        assert isinstance(item, SimpleString)
+        if params.replica_flow < 4:
+            assert isinstance(item, SimpleString)
+        elif params.replica_flow == 4:
+            # TODO: apply rdb from master
+            assert isinstance(item, BulkString)
+        else:  # REPLICATION is ESTABLISHED PARSE AS CLIENT BUT DO NOT RESPOND
+            # TODO: code duplication
+            assert isinstance(item, Array)
+            command = item.a[0]
+            assert isinstance(command, BulkString)
+            com = command.b.upper()
+
+            f = f_mapping.get(com)
+            if f is None:
+                raise NotImplementedError
+
+            print("REPLICATION:", item)
+            f(store, params, client, item, respond=False)
+            continue
+
         params.replica_flow += 1
+        print("FROM MASTER:", params.replica_flow, item)
         if params.replica_flow == 1:
             data = Array(
                 a=[
