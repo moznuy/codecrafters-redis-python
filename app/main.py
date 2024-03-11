@@ -249,19 +249,32 @@ class Storage:
                 result.append(Array(a=[encode_xid(xid), encode_array(items)]))
         return Array(a=result)
 
-    def xread(self, keys: list[bytes], raw_ids: list[bytes]):
+    def xread(
+        self, keys: list[bytes], raw_ids: list[bytes], last_xids: dict[bytes, XID]
+    ):
         key: bytes
         raw_ids: bytes
 
         result = []
         for key, raw_id in zip(keys, raw_ids, strict=True):
-            start = self._get_seq(raw_id, 0)
+            if raw_id == b"$":
+                start = None
+            else:
+                start = self._get_seq(raw_id, 0)
 
             val = self.storage.get(key)
             if val is None:
                 continue
             stream = val.value
             assert isinstance(stream, Stream)
+
+            if start is None:
+                start = last_xids.get(key)
+
+            if start is None:
+                with contextlib.suppress(IndexError):
+                    last_xid = stream.s[-1][0]
+                    last_xids[key] = start = last_xid
 
             result_inner = []
             for xid, items in stream.s:
@@ -799,9 +812,10 @@ def xread_command(
     assert len(rest) % 2 == 0
     keys = rest[: len(rest) // 2]
     raw_ids = rest[len(rest) // 2 :]
+    last_xids: dict[bytes, XID] = {}
     print("XREAD", block_ms, keys, raw_ids)
 
-    response = store.xread(keys, raw_ids)
+    response = store.xread(keys, raw_ids, last_xids)
     if response is not None:
         client.send(encode_array(response).serialize())
         return
@@ -812,7 +826,12 @@ def xread_command(
     end = now + datetime.timedelta(milliseconds=block_ms) if block_ms else None
     loop.append(
         functools.partial(
-            xread_command_cont, keys=keys, raw_ids=raw_ids, client=client, end=end
+            xread_command_cont,
+            keys=keys,
+            raw_ids=raw_ids,
+            last_xids=last_xids,
+            client=client,
+            end=end,
         )
     )
     # print("SCHED")
@@ -825,10 +844,11 @@ def xread_command_cont(
     *,
     keys: list[bytes],
     raw_ids: list[bytes],
+    last_xids: dict[bytes, XID],
     client: Client,
     end: datetime.datetime | None,
 ):
-    response = store.xread(keys, raw_ids)
+    response = store.xread(keys, raw_ids, last_xids)
     if response is not None:
         client.send(encode_array(response).serialize())
         return
@@ -838,7 +858,12 @@ def xread_command_cont(
         return
     loop.append(
         functools.partial(
-            xread_command_cont, keys=keys, raw_ids=raw_ids, client=client, end=end
+            xread_command_cont,
+            keys=keys,
+            raw_ids=raw_ids,
+            last_xids=last_xids,
+            client=client,
+            end=end,
         )
     )
     # print("SCHED")
