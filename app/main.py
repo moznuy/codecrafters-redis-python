@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import datetime
 import select
 import socket
 
@@ -40,7 +41,7 @@ class Array(ProtocolItem):
 
 @dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
 class StorageMeta:
-    pass
+    expire: datetime.datetime | None = None
 
 
 @dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
@@ -67,11 +68,16 @@ class Storage:
         if key not in self.storage:
             return NullBulkString()
         item = self.storage[key]
+        if item.meta.expire:
+            now = datetime.datetime.now(tz=datetime.UTC)
+            if now > item.meta.expire:  # TODO: passive deletion? or not?
+                del self.storage[key]
+                return NullBulkString()
         assert isinstance(item.value, Simple)
         return BulkString(b=item.value.b)
 
-    def set(self, key: bytes, value: bytes):
-        self.storage[key] = StorageItem(meta=StorageMeta(), value=Simple(b=value))
+    def set(self, key: bytes, value: bytes, expire: datetime.datetime | None = None):
+        self.storage[key] = StorageItem(meta=StorageMeta(expire=expire), value=Simple(b=value))
         return SimpleString(s='OK')
 
 
@@ -152,7 +158,17 @@ def set_command(store: Storage, client: Client, item: ProtocolItem):
     assert isinstance(key, BulkString)
     value = item.a[2]
     assert isinstance(value, BulkString)
-    result = store.set(key.b, value.b)
+    expire = None
+
+    if len(item.a) > 3:
+        assert isinstance(item.a[3], BulkString)
+        assert item.a[3].b.upper() == b'PX'
+
+        assert isinstance(item.a[4], BulkString)
+        ms = int(item.a[4].b)
+        expire = datetime.datetime.now(tz=datetime.UTC) + datetime.timedelta(milliseconds=ms)
+
+    result = store.set(key.b, value.b, expire)
     response = result.serialize()
     client.socket.sendall(response)
 
