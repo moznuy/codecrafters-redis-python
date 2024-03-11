@@ -228,6 +228,8 @@ def serve_client(store: Storage, params: Params, client: Client):
 @dataclasses.dataclass(kw_only=True, slots=True)
 class Params:
     master: bool = True
+    master_host: str = ""
+    master_port: int = 0
 
 
 def main():
@@ -236,15 +238,23 @@ def main():
         description="Custom Redis Implementation",
         epilog="2024 @ Serhii Chaykov",
     )
-    parser.add_argument("-p", "--port", default=6379, type=int)
+    parser.add_argument("--port", default=6379, type=int)
+    parser.add_argument("--replicaof", nargs="+", default=[])
     args = parser.parse_args()
     print("Starting Redis on port {}".format(args.port))
+    params = Params()
+
+    if args.replicaof:
+        params.master = False
+        params.master_host = args.replicaof[0]
+        params.master_port = int(args.replicaof[1])
+
+    print(f"Params : {params}")
 
     server_socket = socket.create_server(("localhost", args.port), reuse_port=True)
     server_socket.setblocking(False)
     client_sockets: dict[socket.socket, Client] = {}
     store = Storage()
-    params = Params()
 
     while True:
         read_sockets = [server_socket] + list(client_sockets)
