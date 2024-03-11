@@ -40,6 +40,12 @@ class NullBulkString(ProtocolItem):
 class Array(ProtocolItem):
     a: list[ProtocolItem]
 
+    def serialize(self) -> bytes:
+        result = b"*" + str(len(self.a)).encode() + b"\r\n"
+        for item in self.a:
+            result += item.serialize()
+        return result
+
 
 @dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
 class StorageMeta:
@@ -228,6 +234,19 @@ def serve_client(store: Storage, params: Params, client: Client):
         f(store, params, client, item)
 
 
+def serve_master(store: Storage, params: Params, client: Client):
+    while True:
+        if not client.data:
+            break
+
+        result = read_next_value(client.data)
+        if result is None:
+            break
+
+        item, client.data = result
+        print("FROM MASTER:", item)
+
+
 @dataclasses.dataclass(kw_only=True, slots=True)
 class Params:
     master: bool = True
@@ -247,7 +266,6 @@ def main():
     parser.add_argument("--port", default=6379, type=int)
     parser.add_argument("--replicaof", nargs="+", default=[])
     args = parser.parse_args()
-    print("Starting Redis on port {}".format(args.port))
     params = Params(master_replid=random.randbytes(20).hex())
 
     if args.replicaof:
@@ -256,6 +274,18 @@ def main():
         params.master_port = int(args.replicaof[1])
 
     print(f"Params : {params}")
+    print("Starting Redis on port {}".format(args.port))
+
+    replica = None
+    if not params.master:
+        replica_socket = socket.create_connection(
+            (params.master_host, params.master_port)
+        )
+        replica_socket.setblocking(False)
+        ping = Array(a=[BulkString(b=b"PING")])
+        payload = ping.serialize()
+        replica_socket.sendall(payload)
+        replica = Client(socket=replica_socket, data=b"")
 
     server_socket = socket.create_server(("localhost", args.port), reuse_port=True)
     server_socket.setblocking(False)
@@ -263,12 +293,24 @@ def main():
     store = Storage()
 
     while True:
-        read_sockets = [server_socket] + list(client_sockets)
+        read_sockets = list(client_sockets)
+        read_sockets.append(server_socket)
+        if not params.master:
+            read_sockets.append(replica.socket)
+
         read, _, _ = select.select(read_sockets, [], [], None)
         for sock in read:
             if sock == server_socket:
-                client, address = server_socket.accept()
+                client, address = sock.accept()
                 client_sockets[client] = Client(socket=client, data=b"")
+                continue
+
+            if replica and sock == replica.socket:
+                recv = sock.recv(4096)
+                if not recv:
+                    raise RuntimeError("Master connection closed")
+                replica.data += recv
+                serve_master(store, params, replica)
                 continue
 
             recv = sock.recv(4096)
