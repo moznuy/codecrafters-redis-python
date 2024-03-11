@@ -17,7 +17,7 @@ class SimpleString(ProtocolItem):
     s: str
 
     def serialize(self) -> bytes:
-        return b'+' + self.s.encode() + b'\r\n'
+        return b"+" + self.s.encode() + b"\r\n"
 
 
 @dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
@@ -77,41 +77,43 @@ class Storage:
         return BulkString(b=item.value.b)
 
     def set(self, key: bytes, value: bytes, expire: datetime.datetime | None = None):
-        self.storage[key] = StorageItem(meta=StorageMeta(expire=expire), value=Simple(b=value))
-        return SimpleString(s='OK')
+        self.storage[key] = StorageItem(
+            meta=StorageMeta(expire=expire), value=Simple(b=value)
+        )
+        return SimpleString(s="OK")
 
 
 def read_next_value(data: bytes) -> tuple[ProtocolItem, bytes] | None:
     assert data
 
     byte, data = data[:1], data[1:]
-    if byte == b'+':  # Simple String
-        index = data.find(b'\r\n')
+    if byte == b"+":  # Simple String
+        index = data.find(b"\r\n")
         if index == -1:  # Not enough data
             return None
-        raw_string, data = data[:index], data[index+2:]
+        raw_string, data = data[:index], data[index + 2 :]
         return SimpleString(s=raw_string.decode()), data
 
-    if byte == b'$':  # Bulk String
-        index = data.find(b'\r\n')
+    if byte == b"$":  # Bulk String
+        index = data.find(b"\r\n")
         if index == -1:  # Not enough data
             return None
         length = int(data[:index])  # TODO: protocol error
-        index2 = data.find(b'\r\n', index + 2)
+        index2 = data.find(b"\r\n", index + 2)
         if index2 == -1:  # Not enough data
             return None
-        s = data[index+2: index2]
-        data = data[index2+2:]
+        s = data[index + 2 : index2]
+        data = data[index2 + 2 :]
         assert length == len(s)  # TODO: protocol error
         return BulkString(b=s), data
 
-    if byte == b'*':  # Array
-        index = data.find(b'\r\n')
+    if byte == b"*":  # Array
+        index = data.find(b"\r\n")
         if index == -1:  # Not enough data
             return None
         length = int(data[:index])  # TODO: protocol error
         res = Array(a=[])
-        data = data[index+2:]
+        data = data[index + 2 :]
         for _ in range(length):
             result = read_next_value(data)
             if result is None:  # Not enough data
@@ -162,11 +164,13 @@ def set_command(store: Storage, client: Client, item: ProtocolItem):
 
     if len(item.a) > 3:
         assert isinstance(item.a[3], BulkString)
-        assert item.a[3].b.upper() == b'PX'
+        assert item.a[3].b.upper() == b"PX"
 
         assert isinstance(item.a[4], BulkString)
         ms = int(item.a[4].b)
-        expire = datetime.datetime.now(tz=datetime.UTC) + datetime.timedelta(milliseconds=ms)
+        expire = datetime.datetime.now(tz=datetime.UTC) + datetime.timedelta(
+            milliseconds=ms
+        )
 
     result = store.set(key.b, value.b, expire)
     response = result.serialize()
@@ -174,10 +178,10 @@ def set_command(store: Storage, client: Client, item: ProtocolItem):
 
 
 f_mapping = {
-    b'PING': ping_command,
-    b'ECHO': echo_command,
-    b'GET': get_command,
-    b'SET': set_command,
+    b"PING": ping_command,
+    b"ECHO": echo_command,
+    b"GET": get_command,
+    b"SET": set_command,
 }
 
 
@@ -215,7 +219,7 @@ def main():
         for sock in read:
             if sock == server_socket:
                 client, address = server_socket.accept()
-                client_sockets[client] = Client(socket=client, data=b'')
+                client_sockets[client] = Client(socket=client, data=b"")
                 continue
 
             recv = sock.recv(4096)
