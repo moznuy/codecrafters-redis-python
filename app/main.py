@@ -7,22 +7,72 @@ import socket
 
 @dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
 class ProtocolItem:
-    pass
+    def serialize(self) -> bytes:
+        raise NotImplementedError
 
 
 @dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
 class SimpleString(ProtocolItem):
     s: str
 
+    def serialize(self) -> bytes:
+        return b'+' + self.s.encode() + b'\r\n'
+
 
 @dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
 class BulkString(ProtocolItem):
     b: bytes
 
+    def serialize(self) -> bytes:
+        return b"$" + str(len(self.b)).encode() + b"\r\n" + self.b + b"\r\n"
+
+
+@dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
+class NullBulkString(ProtocolItem):
+    def serialize(self) -> bytes:
+        return b"$-1\r\n"
+
 
 @dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
 class Array(ProtocolItem):
     a: list[ProtocolItem]
+
+
+@dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
+class StorageMeta:
+    pass
+
+
+@dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
+class StorageValue:
+    pass
+
+
+@dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
+class Simple(StorageValue):
+    b: bytes
+
+
+@dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
+class StorageItem:
+    meta: StorageMeta
+    value: StorageValue
+
+
+class Storage:
+    def __init__(self):
+        self.storage: dict[bytes, StorageItem] = {}
+
+    def get(self, key: bytes) -> ProtocolItem:
+        if key not in self.storage:
+            return NullBulkString()
+        item = self.storage[key]
+        assert isinstance(item.value, Simple)
+        return BulkString(b=item.value.b)
+
+    def set(self, key: bytes, value: bytes):
+        self.storage[key] = StorageItem(meta=StorageMeta(), value=Simple(b=value))
+        return SimpleString(s='OK')
 
 
 def read_next_value(data: bytes) -> tuple[ProtocolItem, bytes] | None:
@@ -64,7 +114,7 @@ def read_next_value(data: bytes) -> tuple[ProtocolItem, bytes] | None:
             res.a.append(item)
         return res, data
 
-    raise NotImplemented
+    raise NotImplementedError
 
 
 @dataclasses.dataclass(kw_only=True, slots=True)
@@ -73,12 +123,12 @@ class Client:
     data: bytes
 
 
-def ping_command(client: Client, item: ProtocolItem):
+def ping_command(store: Storage, client: Client, item: ProtocolItem):
     assert isinstance(item, Array)
     client.socket.sendall(b"+PONG\r\n")  # TODO: implement serialization
 
 
-def echo_command(client: Client, item: ProtocolItem):
+def echo_command(store: Storage, client: Client, item: ProtocolItem):
     assert isinstance(item, Array)
     word = item.a[1]
     assert isinstance(word, BulkString)
@@ -87,7 +137,35 @@ def echo_command(client: Client, item: ProtocolItem):
     client.socket.sendall(resp)
 
 
-def serve_client(client: Client):
+def get_command(store: Storage, client: Client, item: ProtocolItem):
+    assert isinstance(item, Array)
+    key = item.a[1]
+    assert isinstance(key, BulkString)
+    result = store.get(key.b)
+    response = result.serialize()
+    client.socket.sendall(response)
+
+
+def set_command(store: Storage, client: Client, item: ProtocolItem):
+    assert isinstance(item, Array)
+    key = item.a[1]
+    assert isinstance(key, BulkString)
+    value = item.a[2]
+    assert isinstance(value, BulkString)
+    result = store.set(key.b, value.b)
+    response = result.serialize()
+    client.socket.sendall(response)
+
+
+f_mapping = {
+    b'PING': ping_command,
+    b'ECHO': echo_command,
+    b'GET': get_command,
+    b'SET': set_command,
+}
+
+
+def serve_client(store: Storage, client: Client):
     while True:
         if not client.data:
             break
@@ -100,22 +178,20 @@ def serve_client(client: Client):
         assert isinstance(item, Array)
         command = item.a[0]
         assert isinstance(command, BulkString)
+        com = command.b.upper()
 
-        if command.b.upper() == b'PING':
-            ping_command(client, item)
-            continue
+        f = f_mapping.get(com)
+        if f is None:
+            raise NotImplementedError
 
-        if command.b.upper() == b'ECHO':
-            echo_command(client, item)
-            continue
-
-        raise NotImplemented
+        f(store, client, item)
 
 
 def main():
     server_socket = socket.create_server(("localhost", 6379), reuse_port=True)
     server_socket.setblocking(False)
     client_sockets: dict[socket.socket, Client] = {}
+    store = Storage()
 
     while True:
         read_sockets = [server_socket] + list(client_sockets)
@@ -134,7 +210,7 @@ def main():
 
             client = client_sockets[sock]
             client.data += recv
-            serve_client(client)
+            serve_client(store, client)
 
 
 if __name__ == "__main__":
