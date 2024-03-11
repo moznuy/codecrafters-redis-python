@@ -75,12 +75,18 @@ class StorageMeta:
 
 @dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
 class StorageValue:
-    pass
+    @staticmethod
+    def type():
+        return SimpleString(s="none")
 
 
 @dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
 class Simple(StorageValue):
     b: bytes
+
+    @staticmethod
+    def type():
+        return SimpleString(s="string")
 
 
 @dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
@@ -96,14 +102,22 @@ class Storage:
     def get(self, key: bytes) -> ProtocolItem:
         if key not in self.storage:
             return NullBulkString()
+
+        if not self._check_exp(key):
+            return NullBulkString()
+
+        item = self.storage[key]
+        assert isinstance(item.value, Simple)
+        return BulkString(b=item.value.b)
+
+    def _check_exp(self, key: bytes) -> bool:
         item = self.storage[key]
         if item.meta.expire:
             now = datetime.datetime.now(tz=datetime.UTC)
             if now > item.meta.expire:  # TODO: passive deletion? or not?
                 del self.storage[key]
-                return NullBulkString()
-        assert isinstance(item.value, Simple)
-        return BulkString(b=item.value.b)
+                return False
+        return True
 
     def set(self, key: bytes, value: bytes, expire: datetime.datetime | None = None):
         now = datetime.datetime.now(tz=datetime.UTC)
@@ -118,6 +132,16 @@ class Storage:
     def keys(self):
         keys = list(self.storage.keys())
         return Array(a=[BulkString(b=key) for key in keys])
+
+    def type(self, key: bytes):
+        if key not in self.storage:
+            return StorageValue.type()
+
+        if not self._check_exp(key):
+            return StorageValue.type()
+
+        item = self.storage[key]
+        return item.value.type()
 
 
 def read_next_value(data: bytes) -> tuple[ProtocolItem, bytes, int] | None:
@@ -541,6 +565,21 @@ def keys_command(
     client.send(response.serialize())
 
 
+def type_command(
+    loop: list,
+    store: Storage,
+    params: Params,
+    client: Client,
+    item: ProtocolItem,
+    replication_connection: bool,
+):
+    assert isinstance(item, Array)
+    key = item.a[1]
+    assert isinstance(key, BulkString)
+    response = store.type(key.b)
+    client.send(response.serialize())
+
+
 class CommandProtocol(Protocol):
     def __call__(
         self,
@@ -566,6 +605,7 @@ f_mapping: dict[bytes, CommandProtocol] = {
     b"WAIT": wait_command,
     b"CONFIG": config_command,
     b"KEYS": keys_command,
+    b"TYPE": type_command,
 }
 
 
