@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import dataclasses
 import datetime
 import select
@@ -208,7 +209,15 @@ def serve_client(store: Storage, client: Client):
 
 
 def main():
-    server_socket = socket.create_server(("localhost", 6379), reuse_port=True)
+    parser = argparse.ArgumentParser(
+        prog='CodeCrafters Redis Python',
+        description='Custom Redis Implementation',
+        epilog='2024 @ Serhii Chaykov')
+    parser.add_argument('-p', '--port', default=6379, type=int)
+    args = parser.parse_args()
+    print("Starting Redis on port {}".format(args.port))
+
+    server_socket = socket.create_server(("localhost", args.port), reuse_port=True)
     server_socket.setblocking(False)
     client_sockets: dict[socket.socket, Client] = {}
     store = Storage()
