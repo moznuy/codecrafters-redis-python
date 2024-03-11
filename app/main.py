@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import dataclasses
 import datetime
 import logging
@@ -27,8 +28,11 @@ class SimpleString(ProtocolItem):
 class BulkString(ProtocolItem):
     b: bytes
 
-    def serialize(self) -> bytes:
-        return b"$" + str(len(self.b)).encode() + b"\r\n" + self.b + b"\r\n"
+    def serialize(self, trailing=True) -> bytes:
+        result = b"$" + str(len(self.b)).encode() + b"\r\n" + self.b
+        if trailing:
+            result += b"\r\n"
+        return result
 
 
 @dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
@@ -228,6 +232,12 @@ def psync_command(store: Storage, params: Params, client: Client, item: Protocol
         s=f"FULLRESYNC {params.master_replid} {params.master_repl_offset}"
     )
     response = result.serialize()
+    client.socket.sendall(response)
+
+    # TODO: construct properly
+    empty_rdb = "UkVESVMwMDEx+glyZWRpcy12ZXIFNy4yLjD6CnJlZGlzLWJpdHPAQPoFY3RpbWXCbQi8ZfoIdXNlZC1tZW3CsMQQAPoIYW9mLWJhc2XAAP/wbjv+wP9aog=="
+    result = BulkString(b=base64.b64decode(empty_rdb))
+    response = result.serialize(trailing=False)
     client.socket.sendall(response)
 
 
