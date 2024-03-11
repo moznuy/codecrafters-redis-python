@@ -384,7 +384,7 @@ def wait_command(
     replicas = int(replicas_raw.b)
     wait_ms = int(wait_ms_raw.b)
 
-    result = Integer(n=0)
+    result = Integer(n=len(params.master_replicas))
     response = result.serialize()
     client.socket.sendall(response)
 
