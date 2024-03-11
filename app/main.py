@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime
+import random
 import select
 import socket
 
@@ -188,6 +189,8 @@ def info_command(store: Storage, params: Params, client: Client, item: ProtocolI
         b=f"""\
 # Replication
 role:{role}
+master_replid:{params.master_replid}
+master_repl_offset:{params.master_repl_offset}
 """.encode()
     )
     response = result.serialize()
@@ -228,6 +231,9 @@ def serve_client(store: Storage, params: Params, client: Client):
 @dataclasses.dataclass(kw_only=True, slots=True)
 class Params:
     master: bool = True
+    master_replid: str = ""
+    master_repl_offset: int = 0
+
     master_host: str = ""
     master_port: int = 0
 
@@ -242,7 +248,7 @@ def main():
     parser.add_argument("--replicaof", nargs="+", default=[])
     args = parser.parse_args()
     print("Starting Redis on port {}".format(args.port))
-    params = Params()
+    params = Params(master_replid=random.randbytes(20).hex())
 
     if args.replicaof:
         params.master = False
