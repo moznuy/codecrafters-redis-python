@@ -233,7 +233,11 @@ class Storage:
 
     def xrange(self, key: bytes, start_raw: bytes, end_raw: bytes):
         start = self._get_seq(start_raw, -1) if start_raw != b"-" else XID(0, 0)
-        end = self._get_seq(end_raw, 2**64 - 1)
+        end = (
+            self._get_seq(end_raw, 2**64 - 1)
+            if end_raw != b"+"
+            else XID(2**64 - 1, 2**64 - 1)
+        )
 
         value = self.storage.setdefault(
             key, StorageItem(meta=StorageMeta(), value=Stream(s=[]))
