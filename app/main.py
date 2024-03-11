@@ -189,6 +189,12 @@ def set_command(store: Storage, params: Params, client: Client, item: ProtocolIt
     response = result.serialize()
     client.socket.sendall(response)
 
+    propagate = item.serialize()
+    if params.master_replicas:
+        print("Propagation to replicas:", propagate)
+    for replica in params.master_replicas:
+        replica.socket.sendall(propagate)
+
 
 def info_command(store: Storage, params: Params, client: Client, item: ProtocolItem):
     assert isinstance(item, Array)
@@ -239,6 +245,7 @@ def psync_command(store: Storage, params: Params, client: Client, item: Protocol
     result = BulkString(b=base64.b64decode(empty_rdb))
     response = result.serialize(trailing=False)
     client.socket.sendall(response)
+    params.master_replicas.append(client)
 
 
 f_mapping = {
@@ -322,9 +329,11 @@ def serve_master(store: Storage, params: Params, client: Client):
 @dataclasses.dataclass(kw_only=True, slots=True)
 class Params:
     port: int = 0
+
     master: bool = True
     master_replid: str = ""
     master_repl_offset: int = 0
+    master_replicas: list[Client] = dataclasses.field(default_factory=list)
 
     master_host: str = ""
     master_port: int = 0
