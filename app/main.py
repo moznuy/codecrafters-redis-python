@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime
+import logging
 import random
 import select
 import socket
@@ -248,24 +249,34 @@ def serve_master(store: Storage, params: Params, client: Client):
         assert isinstance(item, SimpleString)
         params.replica_flow += 1
         if params.replica_flow == 1:
-            ping = Array(
+            data = Array(
                 a=[
                     BulkString(b=b"REPLCONF"),
                     BulkString(b=b"listening-port"),
                     BulkString(b=str(params.port).encode()),
                 ]
             )
-            payload = ping.serialize()
+            payload = data.serialize()
             client.socket.sendall(payload)
         if params.replica_flow == 2:
-            ping = Array(
+            data = Array(
                 a=[
                     BulkString(b=b"REPLCONF"),
                     BulkString(b=b"capa"),
                     BulkString(b=b"psync2"),
                 ]
             )
-            payload = ping.serialize()
+            payload = data.serialize()
+            client.socket.sendall(payload)
+        if params.replica_flow == 3:
+            data = Array(
+                a=[
+                    BulkString(b=b"PSYNC"),
+                    BulkString(b=b"?"),
+                    BulkString(b=str(params.replica_offset).encode()),
+                ]
+            )
+            payload = data.serialize()
             client.socket.sendall(payload)
 
 
@@ -279,6 +290,8 @@ class Params:
     master_host: str = ""
     master_port: int = 0
     replica_flow: int = 0
+    replica_offset: int = -1
+    replica_active: bool = True
 
 
 def main():
@@ -319,7 +332,7 @@ def main():
     while True:
         read_sockets = list(client_sockets)
         read_sockets.append(server_socket)
-        if not params.master:
+        if not params.master and params.replica_active:
             read_sockets.append(replica.socket)
 
         read, _, _ = select.select(read_sockets, [], [], None)
@@ -332,7 +345,9 @@ def main():
             if replica and sock == replica.socket:
                 recv = sock.recv(4096)
                 if not recv:
-                    raise RuntimeError("Master connection closed")
+                    logging.warning(f"Master connection closed")
+                    params.replica_active = False
+                    continue
                 replica.data += recv
                 serve_master(store, params, replica)
                 continue
