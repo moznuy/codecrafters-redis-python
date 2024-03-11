@@ -4,10 +4,13 @@ import argparse
 import base64
 import dataclasses
 import datetime
+import functools
 import logging
 import random
 import select
 import socket
+import time
+from typing import Callable
 from typing import Protocol
 
 
@@ -172,17 +175,26 @@ def read_next_value_rdb(data: bytes) -> tuple[ProtocolItem, bytes, int] | None:
 
     # TODO: determine why sometimes this fails with actual redis
     # Something missing in packets concat/divide
-    print(byte + data)
+    print("TODO" * 5, byte + data)
     raise NotImplementedError
 
 
 @dataclasses.dataclass(kw_only=True, slots=True)
 class Client:
     socket: socket.socket
-    data: bytes
+    data: bytes = b""
+    replica: bool = False
+    expected_offset: int = 0
+    last_offset: int = 0
+
+    def send(self, data: bytes):
+        self.socket.sendall(data)
+        if self.replica:
+            self.expected_offset += len(data)
 
 
 def ping_command(
+    loop: list,
     store: Storage,
     params: Params,
     client: Client,
@@ -192,10 +204,11 @@ def ping_command(
     assert isinstance(item, Array)
     if replication_connection:
         return
-    client.socket.sendall(b"+PONG\r\n")  # TODO: implement serialization
+    client.send(b"+PONG\r\n")  # TODO: implement serialization
 
 
 def echo_command(
+    loop: list,
     store: Storage,
     params: Params,
     client: Client,
@@ -209,10 +222,11 @@ def echo_command(
         return
     # TODO: implement serialization
     resp = b"$" + str(len(word.b)).encode() + b"\r\n" + word.b + b"\r\n"
-    client.socket.sendall(resp)
+    client.send(resp)
 
 
 def get_command(
+    loop: list,
     store: Storage,
     params: Params,
     client: Client,
@@ -226,10 +240,11 @@ def get_command(
     if replication_connection:
         return
     response = result.serialize()
-    client.socket.sendall(response)
+    client.send(response)
 
 
 def set_command(
+    loop: list,
     store: Storage,
     params: Params,
     client: Client,
@@ -257,16 +272,17 @@ def set_command(
     if replication_connection:
         return
     response = result.serialize()
-    client.socket.sendall(response)
+    client.send(response)
 
     propagate = item.serialize()
     if params.master_replicas:
         print("Propagation to replicas:", propagate)
     for replica in params.master_replicas:
-        replica.socket.sendall(propagate)
+        replica.send(propagate)
 
 
 def info_command(
+    loop: list,
     store: Storage,
     params: Params,
     client: Client,
@@ -289,10 +305,11 @@ master_repl_offset:{params.master_repl_offset}
 """.encode()
     )
     response = result.serialize()
-    client.socket.sendall(response)
+    client.send(response)
 
 
 def replconf_command(
+    loop: list,
     store: Storage,
     params: Params,
     client: Client,
@@ -304,8 +321,9 @@ def replconf_command(
     value = item.a[2]
     assert isinstance(name, BulkString)
     assert isinstance(value, BulkString)
+    method = name.b.upper()
 
-    if name.b.upper() == b"GETACK":
+    if method == b"GETACK":
         result = Array(
             a=[
                 BulkString(b=b"REPLCONF"),
@@ -314,18 +332,26 @@ def replconf_command(
             ]
         )
         response = result.serialize()
-        client.socket.sendall(response)
+        client.send(response)
+        return
+    if method == b"ACK":
+        remote_offset = int(value.b)
+        client.last_offset = remote_offset
+        print("REMOTE OFFSET", remote_offset)
+        return
 
-    elif name.b.upper() in [b"SETACK", b"LISTENING-PORT", b"CAPA"]:
+    elif method in [b"LISTENING-PORT", b"CAPA"]:
         result = SimpleString(s="OK")
         response = result.serialize()
-        client.socket.sendall(response)
-    else:
-        print(name.b.upper())
-        raise NotImplementedError
+        client.send(response)
+        return
+
+    print("replconf_command", method)
+    raise NotImplementedError
 
 
 def psync_command(
+    loop: list,
     store: Storage,
     params: Params,
     client: Client,
@@ -344,21 +370,25 @@ def psync_command(
     if replication_connection:
         return
 
+    print(params.master_repl_offset)
     result = SimpleString(
         s=f"FULLRESYNC {params.master_replid} {params.master_repl_offset}"
     )
     response = result.serialize()
-    client.socket.sendall(response)
+    client.send(response)
 
     # TODO: construct properly
     empty_rdb = "UkVESVMwMDEx+glyZWRpcy12ZXIFNy4yLjD6CnJlZGlzLWJpdHPAQPoFY3RpbWXCbQi8ZfoIdXNlZC1tZW3CsMQQAPoIYW9mLWJhc2XAAP/wbjv+wP9aog=="
     result = BulkString(b=base64.b64decode(empty_rdb))
     response = result.serialize(trailing=False)
-    client.socket.sendall(response)
+    client.send(response)
+    client.replica = True
+    client.expected_offset = 0
     params.master_replicas.append(client)  # TODO: remove on disconnect
 
 
 def select_command(
+    loop: list,
     store: Storage,
     params: Params,
     client: Client,
@@ -370,6 +400,7 @@ def select_command(
 
 
 def wait_command(
+    loop: list,
     store: Storage,
     params: Params,
     client: Client,
@@ -384,14 +415,72 @@ def wait_command(
     replicas = int(replicas_raw.b)
     wait_ms = int(wait_ms_raw.b)
 
-    result = Integer(n=len(params.master_replicas))
-    response = result.serialize()
-    client.socket.sendall(response)
+    # print("MASTER WAIT", replicas, wait_ms)
+    ready = sum(
+        1
+        for replica in params.master_replicas
+        if replica.expected_offset == replica.last_offset
+    )
+    if ready >= min(replicas, len(params.master_replicas)):
+        result = Integer(n=ready)
+        response = result.serialize()
+        client.send(response)
+        return
+
+    now = datetime.datetime.now(tz=datetime.UTC)
+    end = now + datetime.timedelta(milliseconds=wait_ms) if wait_ms != 0 else None
+
+    for replica in params.master_replicas:
+        req = Array(
+            a=[
+                BulkString(b=b"REPLCONF"),
+                BulkString(b=b"GETACK"),
+                BulkString(b=b"*"),
+            ]
+        )
+        replica.send(req.serialize())
+
+    # print("SCHED")
+    loop.append(
+        functools.partial(wait_command_cont, client=client, end=end, replicas=replicas)
+    )
+
+
+def wait_command_cont(
+    loop: list,
+    store: Storage,
+    params: Params,
+    *,
+    client: Client,
+    end: datetime.datetime | None,
+    replicas: int,
+):
+    now = datetime.datetime.now(tz=datetime.UTC)
+    ready = sum(
+        1
+        for replica in params.master_replicas
+        if replica.expected_offset == replica.last_offset
+    )
+    # for replica in params.master_replicas:
+    #     print("EXP, LAST, ", replica.expected_offset, replica.last_offset)
+    # print("READY", ready)
+
+    if ready >= replicas or (end is not None and now >= end):
+        result = Integer(n=ready)
+        response = result.serialize()
+        client.send(response)
+        return
+
+    # print("SCHED")
+    loop.append(
+        functools.partial(wait_command_cont, client=client, end=end, replicas=replicas)
+    )
 
 
 class CommandProtocol(Protocol):
     def __call__(
         self,
+        loop: list,
         store: Storage,
         params: Params,
         client: Client,
@@ -414,7 +503,7 @@ f_mapping: dict[bytes, CommandProtocol] = {
 }
 
 
-def serve_client(store: Storage, params: Params, client: Client):
+def serve_client(loop: list, store: Storage, params: Params, client: Client):
     while True:
         if not client.data:
             break
@@ -433,10 +522,11 @@ def serve_client(store: Storage, params: Params, client: Client):
         if f is None:
             raise NotImplementedError
 
-        f(store, params, client, item, replication_connection=False)
+        f(loop, store, params, client, item, replication_connection=False)
+        # params.master_repl_offset += parsed
 
 
-def serve_master(store: Storage, params: Params, client: Client):
+def serve_master(loop: list, store: Storage, params: Params, client: Client):
     while True:
         if not client.data:
             break
@@ -473,9 +563,9 @@ def serve_master(store: Storage, params: Params, client: Client):
                 params.replica_offset + parsed,
                 item,
             )
-            f(store, params, client, item, replication_connection=True)
+            f(loop, store, params, client, item, replication_connection=True)
             params.replica_offset += parsed
-            # client.socket.sendall(Array(a=[BulkString(b=b"PING")]).serialize())
+            # client.send(Array(a=[BulkString(b=b"PING")]).serialize())
             continue
 
         params.replica_flow += 1
@@ -489,7 +579,7 @@ def serve_master(store: Storage, params: Params, client: Client):
                 ]
             )
             payload = data.serialize()
-            client.socket.sendall(payload)
+            client.send(payload)
         if params.replica_flow == 2:
             data = Array(
                 a=[
@@ -499,8 +589,9 @@ def serve_master(store: Storage, params: Params, client: Client):
                 ]
             )
             payload = data.serialize()
-            client.socket.sendall(payload)
+            client.send(payload)
         if params.replica_flow == 3:
+            params.replica_offset = -1
             data = Array(
                 a=[
                     BulkString(b=b"PSYNC"),
@@ -509,7 +600,7 @@ def serve_master(store: Storage, params: Params, client: Client):
                 ]
             )
             payload = data.serialize()
-            client.socket.sendall(payload)
+            client.send(payload)
 
 
 @dataclasses.dataclass(kw_only=True, slots=True)
@@ -538,6 +629,7 @@ def main():
     parser.add_argument("--replicaof", nargs="+", default=[])
     args = parser.parse_args()
     params = Params(master_replid=random.randbytes(20).hex(), port=args.port)
+    loop: list[Callable] = []
 
     if args.replicaof:
         params.master = False
@@ -555,8 +647,8 @@ def main():
         replica_socket.setblocking(False)
         ping = Array(a=[BulkString(b=b"PING")])
         payload = ping.serialize()
-        replica_socket.sendall(payload)
-        replica = Client(socket=replica_socket, data=b"")
+        replica = Client(socket=replica_socket)
+        replica.send(payload)
 
     server_socket = socket.create_server(("localhost", params.port), reuse_port=True)
     server_socket.setblocking(False)
@@ -569,11 +661,12 @@ def main():
         if not params.master and params.replica_active:
             read_sockets.append(replica.socket)
 
-        read, _, _ = select.select(read_sockets, [], [], None)
+        timeout = 0.1 if loop else None
+        read, _, _ = select.select(read_sockets, [], [], timeout)
         for sock in read:
             if sock == server_socket:
                 client, address = sock.accept()
-                client_sockets[client] = Client(socket=client, data=b"")
+                client_sockets[client] = Client(socket=client)
                 continue
 
             if replica and sock == replica.socket:
@@ -583,7 +676,7 @@ def main():
                     params.replica_active = False
                     continue
                 replica.data += recv
-                serve_master(store, params, replica)
+                serve_master(loop, store, params, replica)
                 continue
 
             recv = sock.recv(4096)
@@ -594,7 +687,13 @@ def main():
 
             client = client_sockets[sock]
             client.data += recv
-            serve_client(store, params, client)
+            serve_client(loop, store, params, client)
+
+        next_loop: list[Callable] = []
+        while loop:
+            f = loop.pop(0)
+            f(next_loop, store, params)
+        loop = next_loop
 
 
 if __name__ == "__main__":
