@@ -6,10 +6,10 @@ import dataclasses
 import datetime
 import functools
 import logging
+import os
 import random
 import select
 import socket
-import time
 from typing import Callable
 from typing import Protocol
 
@@ -477,6 +477,43 @@ def wait_command_cont(
     )
 
 
+def config_command(
+    loop: list,
+    store: Storage,
+    params: Params,
+    client: Client,
+    item: ProtocolItem,
+    replication_connection: bool,
+):
+    assert isinstance(item, Array)
+    method = item.a[1]
+    item = item.a[2]
+    assert isinstance(method, BulkString)
+    assert isinstance(item, BulkString)
+    assert method.b.upper() == b"GET"
+    if item.b == b"dir":
+        response = Array(
+            a=[
+                BulkString(b=b"dir"),
+                BulkString(b=params.dir.encode()),
+            ]
+        )
+        client.send(response.serialize())
+        return
+    if item.b == b"dbfilename":
+        response = Array(
+            a=[
+                BulkString(b=b"dbfilename"),
+                BulkString(b=params.dbfilename.encode()),
+            ]
+        )
+        client.send(response.serialize())
+        return
+
+    print(item)
+    raise NotImplementedError
+
+
 class CommandProtocol(Protocol):
     def __call__(
         self,
@@ -500,6 +537,7 @@ f_mapping: dict[bytes, CommandProtocol] = {
     b"PSYNC": psync_command,
     b"SELECT": select_command,
     b"WAIT": wait_command,
+    b"CONFIG": config_command,
 }
 
 
@@ -606,6 +644,8 @@ def serve_master(loop: list, store: Storage, params: Params, client: Client):
 @dataclasses.dataclass(kw_only=True, slots=True)
 class Params:
     port: int = 0
+    dir: str = ""
+    dbfilename: str = ""
 
     master: bool = True
     master_replid: str = ""
@@ -627,8 +667,15 @@ def main():
     )
     parser.add_argument("--port", default=6379, type=int)
     parser.add_argument("--replicaof", nargs="+", default=[])
+    parser.add_argument("--dir", default=".")
+    parser.add_argument("--dbfilename", default="dump.rdb")
     args = parser.parse_args()
-    params = Params(master_replid=random.randbytes(20).hex(), port=args.port)
+    params = Params(
+        master_replid=random.randbytes(20).hex(),
+        port=args.port,
+        dir=args.dir,
+        dbfilename=args.dbfilename,
+    )
     loop: list[Callable] = []
 
     if args.replicaof:
@@ -638,6 +685,7 @@ def main():
 
     print(f"Params : {params}")
     print("Starting Redis on port {}".format(params.port))
+    os.chdir(params.dir)
 
     replica = None
     if not params.master:
