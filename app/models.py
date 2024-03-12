@@ -52,63 +52,9 @@ class Client:
 
 
 @dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
-class ProtocolItem:
-    def serialize(self) -> bytes:
-        raise NotImplementedError
-
-
-@dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
-class SimpleString(ProtocolItem):
-    s: str
-
-    def serialize(self) -> bytes:
-        return b"+" + self.s.encode() + b"\r\n"
-
-
-@dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
-class SimpleError(ProtocolItem):
-    e: str = ""
-    m: str = ""
-
-    def serialize(self) -> bytes:
-        err = (self.e + " " + self.m) if self.e else self.m
-        return b"-" + err.encode() + b"\r\n"
-
-
-@dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
-class Integer(ProtocolItem):
-    n: int
-
-    def serialize(self) -> bytes:
-        return b":" + str(self.n).encode() + b"\r\n"
-
-
-@dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
-class BulkString(ProtocolItem):
-    b: bytes
-
-    def serialize(self, trailing=True) -> bytes:
-        result = b"$" + str(len(self.b)).encode() + b"\r\n" + self.b
-        if trailing:
-            result += b"\r\n"
-        return result
-
-
-@dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
-class NullBulkString(ProtocolItem):
-    def serialize(self) -> bytes:
-        return b"$-1\r\n"
-
-
-@dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
-class Array(ProtocolItem):
-    a: list[ProtocolItem]
-
-    def serialize(self) -> bytes:
-        result = b"*" + str(len(self.a)).encode() + b"\r\n"
-        for item in self.a:
-            result += item.serialize()
-        return result
+class Command:
+    command: bytes
+    args: list[bytes]
 
 
 @dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
@@ -120,7 +66,7 @@ class StorageMeta:
 class StorageValue:
     @staticmethod
     def type():
-        return SimpleString(s="none")
+        raise NotImplementedError
 
 
 @dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
@@ -129,7 +75,7 @@ class Simple(StorageValue):
 
     @staticmethod
     def type():
-        return SimpleString(s="string")
+        return "string"
 
 
 XID = collections.namedtuple("XID", ["time", "seq"])
@@ -141,7 +87,7 @@ class Stream(StorageValue):
 
     @staticmethod
     def type():
-        return SimpleString(s="stream")
+        return "stream"
 
 
 @dataclasses.dataclass(slots=True, frozen=True, kw_only=True)

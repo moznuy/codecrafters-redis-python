@@ -7,20 +7,27 @@ from app import models
 from app import serialization
 
 
+class Err(RuntimeError):
+    error = "ERR"
+
+    def __init__(self, message: str):
+        self.message = message
+
+
 class Storage:
     def __init__(self):
         self.storage: dict[bytes, models.StorageItem] = {}
 
-    def get(self, key: bytes) -> models.ProtocolItem:
+    def get(self, key: bytes):
         if key not in self.storage:
-            return models.NullBulkString()
+            return serialization.NullBulkString
 
         if not self._check_exp(key):
-            return models.NullBulkString()
+            return serialization.NullBulkString
 
         item = self.storage[key]
         assert isinstance(item.value, models.Simple)
-        return models.BulkString(b=item.value.b)
+        return item.value.b
 
     def _check_exp(self, key: bytes) -> bool:
         item = self.storage[key]
@@ -35,40 +42,34 @@ class Storage:
         now = datetime.datetime.now(tz=datetime.UTC)
         if expire and expire < now:
             print("KEY EXPIRED (probably read from rdb)", key)
-            return models.SimpleString(s="OK")
+            return "OK"
         self.storage[key] = models.StorageItem(
             meta=models.StorageMeta(expire=expire), value=models.Simple(b=value)
         )
-        return models.SimpleString(s="OK")
+        return "OK"
 
     def keys(self):
         keys = list(self.storage.keys())
-        return models.Array(a=[models.BulkString(b=key) for key in keys])
+        return keys
 
     def type(self, key: bytes):
         if key not in self.storage:
-            return models.StorageValue.type()
+            return "none"
 
         if not self._check_exp(key):
-            return models.StorageValue.type()
+            return "none"
 
         item = self.storage[key]
         return item.value.type()
 
     @staticmethod
-    def x_validate_id(
-        last_xid: models.XID, new_xid: models.XID
-    ) -> models.SimpleError | None:
+    def x_validate_id(last_xid: models.XID, new_xid: models.XID):
         if new_xid <= models.XID(0, 0):
-            return models.SimpleError(
-                e="ERR",
-                m="The ID specified in XADD must be greater than 0-0",
-            )
+            raise Err("The ID specified in XADD must be greater than 0-0")
 
         if last_xid is not None and new_xid <= last_xid:
-            return models.SimpleError(
-                e="ERR",
-                m="The ID specified in XADD is equal or smaller than the target stream top item",
+            raise Err(
+                "The ID specified in XADD is equal or smaller than the target stream top item"
             )
         return None
 
@@ -106,12 +107,10 @@ class Storage:
                 time, seq = int(time_raw), int(seq_raw)
                 new_xid = models.XID(time, seq)
 
-        err = self.x_validate_id(last_xid, new_xid)
-        if err is not None:
-            return err
+        self.x_validate_id(last_xid, new_xid)
 
         value.s.append((new_xid, tuples))
-        return models.BulkString(b=f"{new_xid.time}-{new_xid.seq}".encode())
+        return f"{new_xid.time}-{new_xid.seq}"
 
     @staticmethod
     def _get_seq(raw: bytes, default: int):
@@ -138,15 +137,8 @@ class Storage:
         result = []
         for xid, items in value.s:
             if start <= xid <= end:  # TODO: binary search
-                result.append(
-                    models.Array(
-                        a=[
-                            serialization.encode_xid(xid),
-                            serialization.encode_array(items),
-                        ]
-                    )
-                )
-        return models.Array(a=result)
+                result.append([xid, [i for item in items for i in item]])
+        return result
 
     def xread(
         self,
@@ -181,7 +173,7 @@ class Storage:
             result_inner = []
             for xid, items in stream.s:
                 if start < xid:  # TODO: binary search
-                    result_inner.append([serialization.encode_xid(xid), items])
+                    result_inner.append([xid, [i for item in items for i in item]])
             if result_inner:
                 result.append([key, result_inner])
         if not result:

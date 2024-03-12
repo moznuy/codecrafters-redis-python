@@ -62,7 +62,6 @@ class EventLoop:
 
     def run_cycle(self):
         assert self.app is not None
-        print(f"{len(self.loop)=}")
         now = datetime.datetime.now(tz=datetime.UTC)
         while True:
             if not self.loop:
