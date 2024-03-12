@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import argparse
 import base64
-import collections
-import contextlib
 import dataclasses
 import datetime
 import functools
@@ -13,406 +11,19 @@ import os
 import random
 import select
 import socket
-from typing import Callable
 from typing import Protocol
 
+from app import loop
+from app import models
+from app import serialization
+from app import store
 
 EMPTY_RDB = "UkVESVMwMDEx+glyZWRpcy12ZXIFNy4yLjD6CnJlZGlzLWJpdHPAQPoFY3RpbWXCbQi8ZfoIdXNlZC1tZW3CsMQQAPoIYW9mLWJhc2XAAP/wbjv+wP9aog=="
 
 
-@dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
-class ProtocolItem:
-    def serialize(self) -> bytes:
-        raise NotImplementedError
-
-
-@dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
-class SimpleString(ProtocolItem):
-    s: str
-
-    def serialize(self) -> bytes:
-        return b"+" + self.s.encode() + b"\r\n"
-
-
-@dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
-class SimpleError(ProtocolItem):
-    e: str = ""
-    m: str = ""
-
-    def serialize(self) -> bytes:
-        err = (self.e + " " + self.m) if self.e else self.m
-        return b"-" + err.encode() + b"\r\n"
-
-
-@dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
-class Integer(ProtocolItem):
-    n: int
-
-    def serialize(self) -> bytes:
-        return b":" + str(self.n).encode() + b"\r\n"
-
-
-@dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
-class BulkString(ProtocolItem):
-    b: bytes
-
-    def serialize(self, trailing=True) -> bytes:
-        result = b"$" + str(len(self.b)).encode() + b"\r\n" + self.b
-        if trailing:
-            result += b"\r\n"
-        return result
-
-
-@dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
-class NullBulkString(ProtocolItem):
-    def serialize(self) -> bytes:
-        return b"$-1\r\n"
-
-
-@dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
-class Array(ProtocolItem):
-    a: list[ProtocolItem]
-
-    def serialize(self) -> bytes:
-        result = b"*" + str(len(self.a)).encode() + b"\r\n"
-        for item in self.a:
-            result += item.serialize()
-        return result
-
-
-@dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
-class StorageMeta:
-    expire: datetime.datetime | None = None
-
-
-@dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
-class StorageValue:
-    @staticmethod
-    def type():
-        return SimpleString(s="none")
-
-
-@dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
-class Simple(StorageValue):
-    b: bytes
-
-    @staticmethod
-    def type():
-        return SimpleString(s="string")
-
-
-@dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
-class Stream(StorageValue):
-    s: list[tuple[XID, list[tuple[bytes, bytes]]]]
-
-    @staticmethod
-    def type():
-        return SimpleString(s="stream")
-
-
-@dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
-class StorageItem:
-    meta: StorageMeta
-    value: StorageValue
-
-
-XID = collections.namedtuple("XID", ["time", "seq"])
-
-
-class Storage:
-    def __init__(self):
-        self.storage: dict[bytes, StorageItem] = {}
-
-    def get(self, key: bytes) -> ProtocolItem:
-        if key not in self.storage:
-            return NullBulkString()
-
-        if not self._check_exp(key):
-            return NullBulkString()
-
-        item = self.storage[key]
-        assert isinstance(item.value, Simple)
-        return BulkString(b=item.value.b)
-
-    def _check_exp(self, key: bytes) -> bool:
-        item = self.storage[key]
-        if item.meta.expire:
-            now = datetime.datetime.now(tz=datetime.UTC)
-            if now > item.meta.expire:  # TODO: passive deletion? or not?
-                del self.storage[key]
-                return False
-        return True
-
-    def set(self, key: bytes, value: bytes, expire: datetime.datetime | None = None):
-        now = datetime.datetime.now(tz=datetime.UTC)
-        if expire and expire < now:
-            print("KEY EXPIRED (probably read from rdb)", key)
-            return SimpleString(s="OK")
-        self.storage[key] = StorageItem(
-            meta=StorageMeta(expire=expire), value=Simple(b=value)
-        )
-        return SimpleString(s="OK")
-
-    def keys(self):
-        keys = list(self.storage.keys())
-        return Array(a=[BulkString(b=key) for key in keys])
-
-    def type(self, key: bytes):
-        if key not in self.storage:
-            return StorageValue.type()
-
-        if not self._check_exp(key):
-            return StorageValue.type()
-
-        item = self.storage[key]
-        return item.value.type()
-
-    @staticmethod
-    def x_validate_id(last_xid: XID, new_xid: XID) -> SimpleError | None:
-        if new_xid <= XID(0, 0):
-            return SimpleError(
-                e="ERR",
-                m="The ID specified in XADD must be greater than 0-0",
-            )
-
-        if last_xid is not None and new_xid <= last_xid:
-            return SimpleError(
-                e="ERR",
-                m="The ID specified in XADD is equal or smaller than the target stream top item",
-            )
-        return None
-
-    @staticmethod
-    def gen_seq(last_xid: XID | None, time: int):
-        if last_xid is None:
-            return 0 if time > 0 else 1
-        elif last_xid.time == time:
-            return last_xid.seq + 1
-        return 0
-
-    def xadd(self, key: bytes, id_raw: bytes, tuples: list):
-        value = self.storage.setdefault(
-            key, StorageItem(meta=StorageMeta(), value=Stream(s=[]))
-        ).value
-        assert isinstance(value, Stream)  # TODO: wrong type
-
-        try:
-            last_xid = value.s[-1][0]
-        except IndexError:
-            last_xid = None
-
-        if id_raw == b"*":
-            time = int(datetime.datetime.now(tz=datetime.UTC).timestamp() * 1000)
-            seq = self.gen_seq(last_xid, time)
-            new_xid = XID(time, seq)
-        else:
-            time_raw, seq_raw = id_raw.split(b"-")
-            if seq_raw == b"*":
-                time = int(time_raw)
-                seq = self.gen_seq(last_xid, time)
-                new_xid = XID(time, seq)
-            else:
-                time, seq = int(time_raw), int(seq_raw)
-                new_xid = XID(time, seq)
-
-        err = self.x_validate_id(last_xid, new_xid)
-        if err is not None:
-            return err
-
-        value.s.append((new_xid, tuples))
-        return BulkString(b=f"{new_xid.time}-{new_xid.seq}".encode())
-
-    @staticmethod
-    def _get_seq(raw: bytes, default: int):
-        warmer = raw.split(b"-")
-        if len(warmer) == 1:
-            xid = XID(int(warmer[0]), default)
-        else:
-            xid = XID(int(warmer[0]), int(warmer[1]))
-        return xid
-
-    def xrange(self, key: bytes, start_raw: bytes, end_raw: bytes):
-        start = self._get_seq(start_raw, -1) if start_raw != b"-" else XID(0, 0)
-        end = (
-            self._get_seq(end_raw, 2**64 - 1)
-            if end_raw != b"+"
-            else XID(2**64 - 1, 2**64 - 1)
-        )
-
-        value = self.storage.setdefault(
-            key, StorageItem(meta=StorageMeta(), value=Stream(s=[]))
-        ).value
-        assert isinstance(value, Stream)  # TODO: wrong type
-        result = []
-        for xid, items in value.s:
-            if start <= xid <= end:  # TODO: binary search
-                result.append(Array(a=[encode_xid(xid), encode_array(items)]))
-        return Array(a=result)
-
-    def xread(
-        self, keys: list[bytes], raw_ids: list[bytes], last_xids: dict[bytes, XID]
-    ):
-        key: bytes
-        raw_ids: bytes
-
-        result = []
-        for key, raw_id in zip(keys, raw_ids, strict=True):
-            if raw_id == b"$":
-                start = None
-            else:
-                start = self._get_seq(raw_id, 0)
-
-            val = self.storage.get(key)
-            if val is None:
-                continue
-            stream = val.value
-            assert isinstance(stream, Stream)
-
-            if start is None:
-                start = last_xids.get(key)
-
-            if start is None:
-                with contextlib.suppress(IndexError):
-                    last_xid = stream.s[-1][0]
-                    last_xids[key] = start = last_xid
-
-            result_inner = []
-            for xid, items in stream.s:
-                if start < xid:  # TODO: binary search
-                    result_inner.append([encode_xid(xid), items])
-            if result_inner:
-                result.append([key, result_inner])
-        if not result:
-            return None
-        return result
-
-
-# TODO: use everywhere
-def encode_int(n: int) -> BulkString:
-    assert isinstance(n, int)
-    return BulkString(b=str(n).encode())
-
-
-# TODO: use everywhere
-def encode_xid(n: XID) -> BulkString:
-    assert isinstance(n, XID)
-    return BulkString(b=f"{n.time}-{n.seq}".encode())
-
-
-# TODO: use everywhere
-def encode_array(a: list) -> Array:
-    assert isinstance(a, list)
-    res = []
-    for x in a:
-        if isinstance(x, BulkString):
-            res.append(x)
-            continue
-        if isinstance(x, bytes):
-            res.append(BulkString(b=x))
-            continue
-        if isinstance(x, tuple):
-            for i in x:
-                assert isinstance(i, bytes)
-                res.append(BulkString(b=i))
-            continue
-        if isinstance(x, list):
-            res.append(encode_array(x))
-            continue
-        print(x)
-        raise NotImplementedError
-    return Array(a=res)
-
-
-def read_next_value(data: bytes) -> tuple[ProtocolItem, bytes, int] | None:
-    assert data
-
-    byte, data = data[:1], data[1:]
-    parsed = 1
-    if byte == b"+":  # Simple String
-        index = data.find(b"\r\n")
-        if index == -1:  # Not enough data
-            return None
-        raw_string, data = data[:index], data[index + 2 :]
-        parsed += index + 2
-        return SimpleString(s=raw_string.decode()), data, parsed
-
-    if byte == b"$":  # Bulk String
-        index = data.find(b"\r\n")
-        if index == -1:  # Not enough data
-            return None
-        length = int(data[:index])  # TODO: protocol error
-        index2 = data.find(b"\r\n", index + 2)
-        if index2 == -1:  # Not enough data
-            return None
-        s = data[index + 2 : index2]
-        data = data[index2 + 2 :]
-        parsed += index2 + 2
-        assert length == len(s)  # TODO: protocol error
-        return BulkString(b=s), data, parsed
-
-    if byte == b"*":  # Array
-        index = data.find(b"\r\n")
-        if index == -1:  # Not enough data
-            return None
-        length = int(data[:index])  # TODO: protocol error
-        res = Array(a=[])
-        data = data[index + 2 :]
-        parsed += index + 2
-        for _ in range(length):
-            result = read_next_value(data)
-            if result is None:  # Not enough data
-                return None
-            item, data, tmp_parsed = result
-            parsed += tmp_parsed
-            res.a.append(item)
-        return res, data, parsed
-
-    raise NotImplementedError
-
-
-def read_next_value_rdb(data: bytes) -> tuple[ProtocolItem, bytes, int] | None:
-    assert data
-
-    # TODO: duplicate code
-    byte, data = data[:1], data[1:]
-    parsed = 1
-    if byte == b"$":  # Bulk String
-        index = data.find(b"\r\n")
-        if index == -1:  # Not enough data
-            return None
-        length = int(data[:index])  # TODO: protocol error
-        data = data[index + 2 :]
-        parsed += index + 2
-        s, data = data[:length], data[length:]
-        if len(s) != length:  # Not enough data
-            return None
-        return BulkString(b=s), data, parsed
-
-    # TODO: determine why sometimes this fails with actual redis
-    # Something missing in packets concat/divide
-    print("TODO" * 5, byte + data)
-    raise NotImplementedError
-
-
-@dataclasses.dataclass(kw_only=True, slots=True)
-class Client:
-    socket: socket.socket
-    data: bytes = b""
-    replica: bool = False
-    expected_offset: int = 0
-    last_offset: int = 0
-
-    def send(self, data: bytes):
-        self.socket.sendall(data)
-        if self.replica:
-            self.expected_offset += len(data)
-
-
 def ping_command(
-    loop: list,
-    store: Storage,
-    params: Params,
-    client: Client,
+    app: models.App,
+    client: models.Client,
     command: Command,
     replication_connection: bool,
 ):
@@ -422,10 +33,8 @@ def ping_command(
 
 
 def echo_command(
-    loop: list,
-    store: Storage,
-    params: Params,
-    client: Client,
+    app: models.App,
+    client: models.Client,
     command: Command,
     replication_connection: bool,
 ):
@@ -438,15 +47,13 @@ def echo_command(
 
 
 def get_command(
-    loop: list,
-    store: Storage,
-    params: Params,
-    client: Client,
+    app: models.App,
+    client: models.Client,
     command: Command,
     replication_connection: bool,
 ):
     key = command.args[0]
-    result = store.get(key)
+    result = app.store.get(key)
     if replication_connection:
         return
     response = result.serialize()
@@ -454,10 +61,8 @@ def get_command(
 
 
 def set_command(
-    loop: list,
-    store: Storage,
-    params: Params,
-    client: Client,
+    app: models.App,
+    client: models.Client,
     command: Command,
     replication_connection: bool,
 ):
@@ -473,24 +78,22 @@ def set_command(
             milliseconds=ms
         )
 
-    result = store.set(key, value, expire)
+    result = app.store.set(key, value, expire)
     if replication_connection:
         return
     response = result.serialize()
     client.send(response)
 
     propagate = command.resp3().serialize()
-    if params.master_replicas:
+    if app.params.master_replicas:
         print("Propagation to replicas:", propagate)
-    for replica in params.master_replicas:
+    for replica in app.params.master_replicas:
         replica.send(propagate)
 
 
 def info_command(
-    loop: list,
-    store: Storage,
-    params: Params,
-    client: Client,
+    app: models.App,
+    client: models.Client,
     command: Command,
     replication_connection: bool,
 ):
@@ -498,13 +101,13 @@ def info_command(
     assert key.upper() == b"REPLICATION"
     if replication_connection:
         return
-    role = "master" if params.master else "slave"
-    result = BulkString(
+    role = "master" if app.params.master else "slave"
+    result = models.BulkString(
         b=f"""\
 # Replication
 role:{role}
-master_replid:{params.master_replid}
-master_repl_offset:{params.master_repl_offset}
+master_replid:{app.params.master_replid}
+master_repl_offset:{app.params.master_repl_offset}
 """.encode()
     )
     response = result.serialize()
@@ -512,10 +115,8 @@ master_repl_offset:{params.master_repl_offset}
 
 
 def replconf_command(
-    loop: list,
-    store: Storage,
-    params: Params,
-    client: Client,
+    app: models.App,
+    client: models.Client,
     command: Command,
     replication_connection: bool,
 ):
@@ -523,11 +124,11 @@ def replconf_command(
     method = command.args[0].upper()
 
     if method == b"GETACK":
-        result = Array(
+        result = models.Array(
             a=[
-                BulkString(b=b"REPLCONF"),
-                BulkString(b=b"ACK"),
-                BulkString(b=str(params.replica_offset).encode()),
+                models.BulkString(b=b"REPLCONF"),
+                models.BulkString(b=b"ACK"),
+                models.BulkString(b=str(app.params.replica_offset).encode()),
             ]
         )
         response = result.serialize()
@@ -540,7 +141,7 @@ def replconf_command(
         return
 
     elif method in [b"LISTENING-PORT", b"CAPA"]:
-        result = SimpleString(s="OK")
+        result = models.SimpleString(s="OK")
         response = result.serialize()
         client.send(response)
         return
@@ -550,10 +151,8 @@ def replconf_command(
 
 
 def psync_command(
-    loop: list,
-    store: Storage,
-    params: Params,
-    client: Client,
+    app: models.App,
+    client: models.Client,
     command: Command,
     replication_connection: bool,
 ):
@@ -566,27 +165,25 @@ def psync_command(
     if replication_connection:
         return
 
-    print(params.master_repl_offset)
-    result = SimpleString(
-        s=f"FULLRESYNC {params.master_replid} {params.master_repl_offset}"
+    print(app.params.master_repl_offset)
+    result = models.SimpleString(
+        s=f"FULLRESYNC {app.params.master_replid} {app.params.master_repl_offset}"
     )
     response = result.serialize()
     client.send(response)
 
     # TODO: construct properly
-    result = BulkString(b=base64.b64decode(EMPTY_RDB))
+    result = models.BulkString(b=base64.b64decode(EMPTY_RDB))
     response = result.serialize(trailing=False)
     client.send(response)
     client.replica = True
     client.expected_offset = 0
-    params.master_replicas.append(client)  # TODO: remove on disconnect
+    app.params.master_replicas.append(client)  # TODO: remove on disconnect
 
 
 def select_command(
-    loop: list,
-    store: Storage,
-    params: Params,
-    client: Client,
+    app: models.App,
+    client: models.Client,
     command: Command,
     replication_connection: bool,
 ):
@@ -595,10 +192,8 @@ def select_command(
 
 
 def wait_command(
-    loop: list,
-    store: Storage,
-    params: Params,
-    client: Client,
+    app: models.App,
+    client: models.Client,
     command: Command,
     replication_connection: bool,
 ):
@@ -608,11 +203,11 @@ def wait_command(
     # print("MASTER WAIT", replicas, wait_ms)
     ready = sum(
         1
-        for replica in params.master_replicas
+        for replica in app.params.master_replicas
         if replica.expected_offset == replica.last_offset
     )
-    if ready >= min(replicas, len(params.master_replicas)):
-        result = Integer(n=ready)
+    if ready >= min(replicas, len(app.params.master_replicas)):
+        result = models.Integer(n=ready)
         response = result.serialize()
         client.send(response)
         return
@@ -620,35 +215,34 @@ def wait_command(
     now = datetime.datetime.now(tz=datetime.UTC)
     end = now + datetime.timedelta(milliseconds=wait_ms) if wait_ms != 0 else None
 
-    for replica in params.master_replicas:
-        req = Array(
+    for replica in app.params.master_replicas:
+        req = models.Array(
             a=[
-                BulkString(b=b"REPLCONF"),
-                BulkString(b=b"GETACK"),
-                BulkString(b=b"*"),
+                models.BulkString(b=b"REPLCONF"),
+                models.BulkString(b=b"GETACK"),
+                models.BulkString(b=b"*"),
             ]
         )
         replica.send(req.serialize())
 
     # print("SCHED")
-    loop.append(
-        functools.partial(wait_command_cont, client=client, end=end, replicas=replicas)
+    app.loop.add(
+        functools.partial(wait_command_cont, client=client, end=end, replicas=replicas),
+        later=datetime.timedelta(milliseconds=100),
     )
 
 
 def wait_command_cont(
-    loop: list,
-    store: Storage,
-    params: Params,
+    app: models.App,
     *,
-    client: Client,
+    client: models.Client,
     end: datetime.datetime | None,
     replicas: int,
 ):
     now = datetime.datetime.now(tz=datetime.UTC)
     ready = sum(
         1
-        for replica in params.master_replicas
+        for replica in app.params.master_replicas
         if replica.expected_offset == replica.last_offset
     )
     # for replica in params.master_replicas:
@@ -656,22 +250,21 @@ def wait_command_cont(
     # print("READY", ready)
 
     if ready >= replicas or (end is not None and now >= end):
-        result = Integer(n=ready)
+        result = models.Integer(n=ready)
         response = result.serialize()
         client.send(response)
         return
 
     # print("SCHED")
-    loop.append(
-        functools.partial(wait_command_cont, client=client, end=end, replicas=replicas)
+    app.loop.add(
+        functools.partial(wait_command_cont, client=client, end=end, replicas=replicas),
+        later=datetime.timedelta(milliseconds=100),
     )
 
 
 def config_command(
-    loop: list,
-    store: Storage,
-    params: Params,
-    client: Client,
+    app: models.App,
+    client: models.Client,
     command: Command,
     replication_connection: bool,
 ):
@@ -679,19 +272,19 @@ def config_command(
     item = command.args[1]
     assert method.upper() == b"GET"
     if item == b"dir":
-        response = Array(
+        response = models.Array(
             a=[
-                BulkString(b=b"dir"),
-                BulkString(b=params.dir.encode()),
+                models.BulkString(b=b"dir"),
+                models.BulkString(b=app.params.dir.encode()),
             ]
         )
         client.send(response.serialize())
         return
     if item == b"dbfilename":
-        response = Array(
+        response = models.Array(
             a=[
-                BulkString(b=b"dbfilename"),
-                BulkString(b=params.dbfilename.encode()),
+                models.BulkString(b=b"dbfilename"),
+                models.BulkString(b=app.params.dbfilename.encode()),
             ]
         )
         client.send(response.serialize())
@@ -702,29 +295,25 @@ def config_command(
 
 
 def keys_command(
-    loop: list,
-    store: Storage,
-    params: Params,
-    client: Client,
+    app: models.App,
+    client: models.Client,
     command: Command,
     replication_connection: bool,
 ):
     mask = command.args[0]
     assert mask == b"*"
-    response = store.keys()
+    response = app.store.keys()
     client.send(response.serialize())
 
 
 def type_command(
-    loop: list,
-    store: Storage,
-    params: Params,
-    client: Client,
+    app: models.App,
+    client: models.Client,
     command: Command,
     replication_connection: bool,
 ):
     key = command.args[0]
-    response = store.type(key)
+    response = app.store.type(key)
     client.send(response.serialize())
 
 
@@ -734,17 +323,19 @@ class Command:
     args: list[bytes]
 
     def resp3(self):
-        arr = [BulkString(b=self.command)] + [BulkString(b=arg) for arg in self.args]
-        return Array(a=arr)
+        arr = [models.BulkString(b=self.command)] + [
+            models.BulkString(b=arg) for arg in self.args
+        ]
+        return models.Array(a=arr)
 
 
-def parse_command(item: ProtocolItem) -> Command:
-    assert isinstance(item, Array)
+def parse_command(item: models.ProtocolItem) -> Command:
+    assert isinstance(item, models.Array)
 
     command = b""
     args: list[bytes] = []
     for i in item.a:
-        assert isinstance(i, BulkString)
+        assert isinstance(i, models.BulkString)
         if not command:
             command = i.b
             continue
@@ -759,10 +350,8 @@ def batched(lst, n):
 
 
 def xadd_command(
-    loop: list,
-    store: Storage,
-    params: Params,
-    client: Client,
+    app: models.App,
+    client: models.Client,
     command: Command,
     replication_connection: bool,
 ):
@@ -771,15 +360,13 @@ def xadd_command(
 
     # TODO 3.12 batched
     tuples = list(batched(command.args[2:], n=2))
-    response = store.xadd(key, id_raw, tuples)
+    response = app.store.xadd(key, id_raw, tuples)
     client.send(response.serialize())
 
 
 def xrange_command(
-    loop: list,
-    store: Storage,
-    params: Params,
-    client: Client,
+    app: models.App,
+    client: models.Client,
     command: Command,
     replication_connection: bool,
 ):
@@ -787,15 +374,13 @@ def xrange_command(
     start = command.args[1]
     end = command.args[2]
 
-    response = store.xrange(key, start, end)
+    response = app.store.xrange(key, start, end)
     client.send(response.serialize())
 
 
 def xread_command(
-    loop: list,
-    store: Storage,
-    params: Params,
-    client: Client,
+    app: models.App,
+    client: models.Client,
     command: Command,
     replication_connection: bool,
 ):
@@ -812,19 +397,20 @@ def xread_command(
     assert len(rest) % 2 == 0
     keys = rest[: len(rest) // 2]
     raw_ids = rest[len(rest) // 2 :]
-    last_xids: dict[bytes, XID] = {}
+    last_xids: dict[bytes, models.XID] = {}
     print("XREAD", block_ms, keys, raw_ids)
 
-    response = store.xread(keys, raw_ids, last_xids)
+    response = app.store.xread(keys, raw_ids, last_xids)
     if response is not None:
-        client.send(encode_array(response).serialize())
+        client.send(serialization.encode_array(response).serialize())
         return
     if block_ms is None:
-        client.send(NullBulkString().serialize())
+        client.send(models.NullBulkString().serialize())
         return
     now = datetime.datetime.now(tz=datetime.UTC)
     end = now + datetime.timedelta(milliseconds=block_ms) if block_ms else None
-    loop.append(
+    # print("SCHED")
+    app.loop.add(
         functools.partial(
             xread_command_cont,
             keys=keys,
@@ -832,31 +418,30 @@ def xread_command(
             last_xids=last_xids,
             client=client,
             end=end,
-        )
+        ),
+        later=datetime.timedelta(milliseconds=100),
     )
-    # print("SCHED")
 
 
 def xread_command_cont(
-    loop: list,
-    store: Storage,
-    params: Params,
+    app: models.App,
     *,
     keys: list[bytes],
     raw_ids: list[bytes],
-    last_xids: dict[bytes, XID],
-    client: Client,
+    last_xids: dict[bytes, models.XID],
+    client: models.Client,
     end: datetime.datetime | None,
 ):
-    response = store.xread(keys, raw_ids, last_xids)
+    response = app.store.xread(keys, raw_ids, last_xids)
     if response is not None:
-        client.send(encode_array(response).serialize())
+        client.send(serialization.encode_array(response).serialize())
         return
     now = datetime.datetime.now(tz=datetime.UTC)
     if end is not None and now >= end:
-        client.send(NullBulkString().serialize())
+        client.send(models.NullBulkString().serialize())
         return
-    loop.append(
+    # print("SCHED")
+    app.loop.add(
         functools.partial(
             xread_command_cont,
             keys=keys,
@@ -864,18 +449,16 @@ def xread_command_cont(
             last_xids=last_xids,
             client=client,
             end=end,
-        )
+        ),
+        later=datetime.timedelta(milliseconds=100),
     )
-    # print("SCHED")
 
 
 class CommandProtocol(Protocol):
     def __call__(
         self,
-        loop: list,
-        store: Storage,
-        params: Params,
-        client: Client,
+        app: models.App,
+        client: models.Client,
         command: Command,
         replication_connection: bool,
     ):
@@ -901,12 +484,12 @@ f_mapping: dict[bytes, CommandProtocol] = {
 }
 
 
-def serve_client(loop: list, store: Storage, params: Params, client: Client):
+def serve_client(app: models.App, client: models.Client):
     while True:
         if not client.data:
             break
 
-        result = read_next_value(client.data)
+        result = serialization.read_next_value(client.data)
         if result is None:
             break
 
@@ -916,29 +499,29 @@ def serve_client(loop: list, store: Storage, params: Params, client: Client):
         if f is None:
             raise NotImplementedError
 
-        f(loop, store, params, client, command, replication_connection=False)
+        f(app, client, command, replication_connection=False)
         # params.master_repl_offset += parsed
 
 
-def serve_master(loop: list, store: Storage, params: Params, client: Client):
+def serve_master(app: models.App, client: models.Client):
     while True:
         if not client.data:
             break
 
-        if params.replica_flow == 4:
-            result = read_next_value_rdb(client.data)
+        if app.params.replica_flow == 4:
+            result = serialization.read_next_value_rdb(client.data)
         else:
-            result = read_next_value(client.data)
+            result = serialization.read_next_value(client.data)
         if result is None:
             break
 
         item, client.data, parsed = result
-        if params.replica_flow < 4:
-            assert isinstance(item, SimpleString)
-        elif params.replica_flow == 4:
+        if app.params.replica_flow < 4:
+            assert isinstance(item, models.SimpleString)
+        elif app.params.replica_flow == 4:
             # TODO: apply rdb from master
-            assert isinstance(item, BulkString)
-            params.replica_offset = 0
+            assert isinstance(item, models.BulkString)
+            app.params.replica_offset = 0
         else:  # REPLICATION is ESTABLISHED PARSE AS CLIENT BUT DO NOT RESPOND
             # TODO: code duplication
             command = parse_command(item)
@@ -948,168 +531,49 @@ def serve_master(loop: list, store: Storage, params: Params, client: Client):
 
             print(
                 "REPLICATION:",
-                params.replica_offset,
+                app.params.replica_offset,
                 parsed,
-                params.replica_offset + parsed,
+                app.params.replica_offset + parsed,
                 item,
             )
-            f(loop, store, params, client, command, replication_connection=True)
-            params.replica_offset += parsed
+            f(app, client, command, replication_connection=True)
+            app.params.replica_offset += parsed
             # client.send(Array(a=[BulkString(b=b"PING")]).serialize())
             continue
 
-        params.replica_flow += 1
+        app.params.replica_flow += 1
         # print("FROM MASTER:", params.replica_flow, item)
-        if params.replica_flow == 1:
-            data = Array(
+        if app.params.replica_flow == 1:
+            data = models.Array(
                 a=[
-                    BulkString(b=b"REPLCONF"),
-                    BulkString(b=b"listening-port"),
-                    BulkString(b=str(params.port).encode()),
+                    models.BulkString(b=b"REPLCONF"),
+                    models.BulkString(b=b"listening-port"),
+                    models.BulkString(b=str(app.params.port).encode()),
                 ]
             )
             payload = data.serialize()
             client.send(payload)
-        if params.replica_flow == 2:
-            data = Array(
+        if app.params.replica_flow == 2:
+            data = models.Array(
                 a=[
-                    BulkString(b=b"REPLCONF"),
-                    BulkString(b=b"capa"),
-                    BulkString(b=b"psync2"),
+                    models.BulkString(b=b"REPLCONF"),
+                    models.BulkString(b=b"capa"),
+                    models.BulkString(b=b"psync2"),
                 ]
             )
             payload = data.serialize()
             client.send(payload)
-        if params.replica_flow == 3:
-            params.replica_offset = -1
-            data = Array(
+        if app.params.replica_flow == 3:
+            app.params.replica_offset = -1
+            data = models.Array(
                 a=[
-                    BulkString(b=b"PSYNC"),
-                    BulkString(b=b"?"),
-                    BulkString(b=str(params.replica_offset).encode()),
+                    models.BulkString(b=b"PSYNC"),
+                    models.BulkString(b=b"?"),
+                    models.BulkString(b=str(app.params.replica_offset).encode()),
                 ]
             )
             payload = data.serialize()
             client.send(payload)
-
-
-@dataclasses.dataclass(kw_only=True, slots=True)
-class Params:
-    port: int = 0
-    dir: str = ""
-    dbfilename: str = ""
-
-    master: bool = True
-    master_replid: str = ""
-    master_repl_offset: int = 0
-    master_replicas: list[Client] = dataclasses.field(default_factory=list)
-
-    master_host: str = ""
-    master_port: int = 0
-    replica_flow: int = 0
-    replica_offset: int = -1
-    replica_active: bool = True
-
-
-def _rdb_read_length(data: bytes) -> tuple[int, bytes]:
-    byte, data = data[0], data[1:]
-
-    ms2 = (byte & 0b11_00_0000) >> 6
-    if ms2 == 0:
-        return byte & 0b00_11_1111, data
-    if ms2 == 1:
-        length = ((byte & 0b00_11_1111) << 6) | data[0]
-        data = data[1:]
-        return length, data
-    if ms2 == 2:
-        length_raw, data = data[:4], data[4:]
-        length = int.from_bytes(length_raw, "little")
-        return length, data
-    if ms2 == 3:
-        special_format = byte & 0b00_11_1111
-        if special_format == 0:  # 8  bit integer
-            return -1, data
-        if special_format == 1:  # 16 bit integer
-            return -2, data
-        if special_format == 2:  # 32 bit integer
-            return -4, data
-        if special_format == 3:  # LZF compressed string
-            return -10, data
-    raise NotImplementedError
-
-
-def _rdb_read_str(data: bytes) -> tuple[bytes, bytes]:
-    l, data = _rdb_read_length(data)
-    if l > 0:
-        s, data = data[:l], data[l:]
-        return s, data
-    elif abs(l) in [1, 2, 4]:
-        l = abs(l)
-        s, data = data[:l], data[l:]
-        return str(int.from_bytes(s, "little")).encode(), data
-    elif l == -10:  # LZF
-        len_compressed, data = _rdb_read_length(data)
-        len_uncompressed, data = _rdb_read_length(data)
-        compressed, data = data[:len_compressed], data[:len_compressed]
-        raise NotImplementedError  # TODO: LZF
-        return b"", data
-    raise NotImplementedError
-
-
-def read_rdb(params: Params) -> Storage:
-    rdb_store = Storage()
-    data = None
-    with contextlib.suppress(FileNotFoundError):
-        with open(params.dbfilename, "rb") as file:
-            data = file.read()
-    if not data:
-        return rdb_store
-
-    magic, data = data[:5], data[5:]
-    assert magic == b"REDIS"
-    version, data = data[:4], data[4:]
-    expiry = None
-
-    while data:
-        byte, data = data[0], data[1:]
-        if byte == 0xFA:  # AUX
-            key, data = _rdb_read_str(data)
-            value, data = _rdb_read_str(data)
-            # print(key, value)
-            continue
-        if byte == 0xFF:  # END
-            break
-        if byte == 0xFE:  # DATABASE Selector
-            db, data = _rdb_read_length(data)
-            assert db == 0
-            continue
-        if byte == 0xFB:  # RESIZEDB
-            # We do not optimize here :)
-            _hash_table_size, data = _rdb_read_length(data)
-            _expiry_table_size, data = _rdb_read_length(data)
-            continue
-        if byte == 0xFC:  # EXPIRETIMEMS
-            ms_raw, data = data[:8], data[8:]
-            ms = int.from_bytes(ms_raw, "little")
-            expiry = datetime.datetime.fromtimestamp(ms / 1000.0, tz=datetime.UTC)
-            continue
-        if 0 <= byte <= 14:  # VALUE TYPE:
-            value_type = byte
-            key, data = _rdb_read_str(data)
-            if value_type == 0:  # String Encoding
-                value, data = _rdb_read_str(data)
-                rdb_store.set(key, value, expiry)
-                expiry = None
-                continue
-
-            print(f"{value_type=}")
-            raise NotImplementedError
-
-        print(f"{byte:02x}")
-        raise NotImplementedError
-
-    print(f"{len(rdb_store.storage)=}")
-    return rdb_store
 
 
 def main():
@@ -1125,13 +589,12 @@ def main():
     parser.add_argument("--dir", default=".")
     parser.add_argument("--dbfilename", default="dump.rdb")
     args = parser.parse_args()
-    params = Params(
+    params = models.Params(
         master_replid=random.randbytes(20).hex(),
         port=args.port,
         dir=args.dir,
         dbfilename=args.dbfilename,
     )
-    loop: list[Callable] = []
 
     if args.replicaof:
         params.master = False
@@ -1141,7 +604,6 @@ def main():
     print(f"Params : {params}")
     print("Starting Redis on port {}".format(params.port))
     os.chdir(params.dir)
-    store = read_rdb(params)
 
     replica = None
     if not params.master:
@@ -1149,14 +611,19 @@ def main():
             (params.master_host, params.master_port)
         )
         replica_socket.setblocking(False)
-        ping = Array(a=[BulkString(b=b"PING")])
+        ping = models.Array(a=[models.BulkString(b=b"PING")])
         payload = ping.serialize()
-        replica = Client(socket=replica_socket)
+        replica = models.Client(socket=replica_socket)
         replica.send(payload)
 
     server_socket = socket.create_server(("localhost", params.port), reuse_port=True)
     server_socket.setblocking(False)
-    client_sockets: dict[socket.socket, Client] = {}
+    client_sockets: dict[socket.socket, models.Client] = {}
+
+    event_loop = loop.EventLoop()
+    storage = store.read_rdb(params)
+    app = models.App(loop=event_loop, params=params, store=storage)
+    event_loop.register(app)
 
     while True:
         read_sockets = list(client_sockets)
@@ -1164,12 +631,12 @@ def main():
         if not params.master and params.replica_active:
             read_sockets.append(replica.socket)
 
-        timeout = 0.1 if loop else None
+        timeout = event_loop.get_timeout()
         read, _, _ = select.select(read_sockets, [], [], timeout)
         for sock in read:
             if sock == server_socket:
                 client, address = sock.accept()
-                client_sockets[client] = Client(socket=client)
+                client_sockets[client] = models.Client(socket=client)
                 continue
 
             if replica and sock == replica.socket:
@@ -1179,7 +646,7 @@ def main():
                     params.replica_active = False
                     continue
                 replica.data += recv
-                serve_master(loop, store, params, replica)
+                serve_master(app, replica)
                 continue
 
             recv = sock.recv(4096)
@@ -1190,13 +657,9 @@ def main():
 
             client = client_sockets[sock]
             client.data += recv
-            serve_client(loop, store, params, client)
+            serve_client(app, client)
 
-        next_loop: list[Callable] = []
-        while loop:
-            f = loop.pop(0)
-            f(next_loop, store, params)
-        loop = next_loop
+        event_loop.run_cycle()
 
 
 if __name__ == "__main__":
